@@ -106,16 +106,68 @@ chrome.storage.onChanged.addListener((ch, area) => {
 $("halted").onchange = () => chrome.storage.sync.set({ halted: $("halted").checked });
 $("show-debug").onchange = applyDebugVisibility;
 
+// ── ENGINE MODE (v0.9): the monitor reads the in-browser swarm engine straight
+//    out of chrome.storage — no localhost, no Python. The engine mirrors every
+//    log line into local.debugRing and its phase into local.swarmState; agent
+//    pills come from querying the bridges directly. Remote mode keeps the
+//    classic HTTP/WS feed below untouched. ────────────────────────────────────
+let bridgeTabs = [];                       // tabs with a live bridge instance
+async function refreshBridgeTabs() {
+  try { bridgeTabs = await chrome.tabs.query({ url: ["https://chat.qwen.ai/*", "https://chat.deepseek.com/*"] }); }
+  catch { bridgeTabs = []; }
+}
+refreshBridgeTabs(); setInterval(refreshBridgeTabs, 5000);
+
+const seenEngineSeq = new Set();           // dedupe engine lines mirrored to tabs
+async function pollEngine() {
+  const { swarmState } = await chrome.storage.local.get({ swarmState: null });
+  if (!swarmState) return false;           // engine never ran → remote discovery next
+  setPill(true, "live · in-browser engine");
+  // roster: ask each bridge for its state + engine-log mirror
+  const agents = {};
+  for (const tab of bridgeTabs) {
+    try {
+      const st = await chrome.tabs.sendMessage(tab.id, { type: "status" });
+      const name = st.agent || new URL(tab.url).hostname.replace(/^chat\./, "");
+      agents[name] = { state: st.state, turns: st.turns };
+      for (const l of (st.log || [])) {
+        if (l.agent !== "engine") continue;
+        const key = `${l.ts}|${l.msg}`;
+        if (seenEngineSeq.has(key)) continue;
+        seenEngineSeq.add(key);
+        renderEvent({ type: "log", agent: "engine", level: l.level, msg: l.msg, data: l.data, ts: l.ts });
+      }
+    } catch {}
+  }
+  if (Object.keys(agents).length) renderAgents(agents);
+  // progress from the engine's own counters
+  const totalTurns = Math.max(1, Number(swarmState.turns) || 6) * 2;
+  $("stat-turns").textContent = Math.min(swarmState.turn || 0, totalTurns);
+  if ((swarmState.turn || 0) > 0 && $("stat-started").textContent === "—")
+    $("stat-started").textContent = new Date().toLocaleTimeString();
+  // start/stop buttons follow the engine phase
+  const b1 = document.getElementById("ctl-start"), b2 = document.getElementById("ctl-stop");
+  if (b1) b1.style.display = swarmState.state === "armed" ? "" : "none";
+  if (b2) b2.style.display = swarmState.state === "running" ? "" : "none";
+  return true;
+}
+
 async function poll() {
   try {
+    const cfg = await chrome.storage.sync.get({ bridgeMode: "engine" });
+    if (cfg.bridgeMode !== "remote") {
+      if (await pollEngine()) return;      // engine is live — nothing else to do
+      // engine idle-and-unaware AND no remote orchestrator either: show offline
+      // but keep trying both paths each tick.
+    }
     if (!httpPort) {
       httpPort = await discoverPort();
-      if (!httpPort) throw new Error("no feed yet");
+      if (!httpPort) throw new Error(cfg.bridgeMode !== "remote" ? "no feed yet (engine idle)" : "no feed yet");
       $("stat-port").textContent = httpPort;
     }
     const st = await tryFetchState(httpPort);
     if (!st) throw new Error("feed gone");
-    setPill(true);
+    setPill(true, "live · orchestrator online");
     renderAgents(st.agents || {});
     for (const ev of (st.events || [])) if (ev.seq > lastSeq) renderEvent(ev);
     trimDom();
@@ -125,10 +177,10 @@ async function poll() {
   }
 }
 
-function setPill(up) {
+function setPill(up, text) {
   const p = $("pill");
   p.className = "pill " + (up ? "pill-live" : "pill-off");
-  $("pill-text").textContent = up ? "live · orchestrator online" : "offline · waiting for orchestrator";
+  $("pill-text").textContent = up ? (text || "live · orchestrator online") : "offline · waiting for orchestrator";
 }
 
 function renderAgents(agents) {

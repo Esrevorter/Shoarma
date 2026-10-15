@@ -22,11 +22,23 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // ── load saved settings ────────────────────────────────────────────────
   const cfg = await chrome.storage.sync.get({
-    topic: "", turns: 6, timeout: 180, port: 8765, halted: false,
+    topic: "", turns: 6, timeout: 180, port: 8765, halted: false, bridgeMode: "engine",
   });
   for (const f of FIELDS) {
     if (f === "halted") $("halted").checked = !!cfg[f];
     else $(f).value = cfg[f] ?? "";
+  }
+  $("bridge-mode").value = cfg.bridgeMode === "remote" ? "remote" : "engine";
+  applyModeUi();
+  $("bridge-mode").addEventListener("change", () => {
+    chrome.storage.sync.set({ bridgeMode: $("bridge-mode").value });
+    act("orchestrator mode → " + $("bridge-mode").value);
+    applyModeUi();
+  });
+  function applyModeUi() {
+    const engine = $("bridge-mode").value !== "remote";
+    $("launch").textContent = engine ? "🚀 Launch swarm" : "🖥️ Start orchestrator";
+    $("port").closest(".field")?.style.setProperty("opacity", engine ? "0.45" : "1");
   }
 
   // ── save-on-change (debounced) — no "apply" button needed anymore ─────
@@ -48,10 +60,12 @@ document.addEventListener("DOMContentLoaded", async () => {
       // the orchestrator now holds ALL dispatch while halted and mirrors the
       // state to every HUD pill + the monitor feed.
       if (next.halted !== undefined) {
-        if (ctlWs?.readyState === 1) {
+        if (currentMode() === "engine") {
+          chrome.runtime.sendMessage({ type: "halted", halted: next.halted });  // engine mirrors to all tabs
+        } else if (ctlWs?.readyState === 1) {
           ctlWs.send(JSON.stringify({ type: "halted", halted: next.halted }));
         } else {
-          act("⚠ halt toggled but orchestrator WS not connected — tabs pause, swarm router does not");
+          act("⚠ halt toggled but remote orchestrator WS not connected — tabs pause, swarm router does not");
         }
       }
       flash("Saved ✓ — open tabs update instantly.");
@@ -60,11 +74,41 @@ document.addEventListener("DOMContentLoaded", async () => {
   };
   FIELDS.forEach((f) => $(f).addEventListener("input", save));
 
-  // ── one-click launch: no terminal, no typing paths ─────────────────────
+  // ── one-click launch. v0.9: in engine mode this ARMS THE SWARM IN-BROWSER —
+  //    no native host, no terminal, no Python. Remote mode keeps the classic
+  //    native-messaging spawn of orchestrator.py for headless users. ─────────
   $("launch").onclick = async () => {
+    const mode = $("bridge-mode").value === "remote" ? "remote" : "engine";
+    if (mode === "engine") {
+      $("launch").disabled = true; $("launch").textContent = "⏳ arming…";
+      act("engine arm requested from popup");
+      try {
+        const st = await chrome.runtime.sendMessage({ type: "engine-state" });
+        const res = await chrome.runtime.sendMessage({
+          type: "arm", topic: $("topic").value.trim(),
+          turns: clamp($("turns").value, 1, 50), timeout: clamp($("timeout").value, 30, 600),
+        });
+        if (res?.ok) {
+          setHint("In-browser engine armed — press ▶ Start swarm. No Python involved.", "ok");
+          act(`engine armed (agents: ${(st?.agents || []).join(", ") || "see tabs"})`);
+          chrome.runtime.sendMessage({ type: "open-monitor" });
+          setStep(2);
+        } else {
+          setHint("Engine needs both agent tabs open and registered — see the roster below.", "err");
+          act("arm refused: fewer than two agents registered");
+        }
+      } catch (e) {
+        setHint("Engine unreachable — reload the extension (chrome://extensions ⟳).", "err");
+        act("engine arm failed: " + e.message);
+      } finally {
+        $("launch").disabled = false; $("launch").textContent = "🚀 Launch swarm";
+      }
+      return;
+    }
+    // remote mode → native launcher spawns orchestrator.py (legacy path)
     $("launch").disabled = true;
     $("launch").textContent = "⏳ starting…";
-    act("launch requested from popup");
+    act("launch requested from popup (remote mode)");
     try {
       const res = await chrome.runtime.sendMessage({ type: "launch" });
       if (res?.ok) {
@@ -85,48 +129,92 @@ document.addEventListener("DOMContentLoaded", async () => {
       act("native launcher missing: " + e.message);
     } finally {
       $("launch").disabled = false;
-      $("launch").textContent = "🚀 Launch swarm";
+      $("launch").textContent = "🖥️ Start orchestrator";
     }
+  };
+
+  // ─── export transcript (engine mode saves to storage; this downloads it) ──
+  $("export").onclick = async () => {
+    const res = await chrome.runtime.sendMessage({ type: "export-transcript" });
+    act("transcript export requested" + (res?.ok ? "" : " (nothing saved yet?)"));
   };
 
   // ── open the live monitor any time (works even without native host) ────
   $("monitor").onclick = () => { chrome.runtime.sendMessage({ type: "open-monitor" }); act("monitor tab opened"); };
 
-  // ── v0.6 ▶ START / ■ STOP — talks to the orchestrator over its own WS port,
-  //    exactly like a HUD pill does. The saved Topic + Turns ride the frame. ──
+  // ── ▶ START / ■ STOP. v0.9: engine mode routes through chrome.runtime to the
+  //    in-browser swarm engine; remote mode keeps the direct WS to the Python
+  //    orchestrator's port — exactly like a HUD pill does. The saved Topic +
+  //    Turns ride the frame. ──────────────────────────────────────────────────
   let ctlWs = null, ctlRetry = 1000;
   function ctlConnect() {
-    try {
-      const ws = new WebSocket(`ws://127.0.0.1:${$("port").value || 8765}`);
-      ctlWs = ws;
-      ws.onopen = () => { ctlRetry = 1000; };
-      ws.onmessage = (ev) => {
-        let m; try { m = JSON.parse(ev.data); } catch { return; }
-        if (m.type === "swarm") applyPhase(m.state);
-      };
-      ws.onclose = () => { ctlWs = null; setTimeout(ctlConnect, Math.min(ctlRetry *= 1.5, 4000)); };
-      ws.onerror = () => { try { ws.close(); } catch {} };
-    } catch {}
+    chrome.storage.sync.get({ bridgeMode: "engine" }, ({ bridgeMode }) => {
+      if (bridgeMode !== "remote") {                 // engine mode: poll storage mirror
+        return;                                      // (no socket at all)
+      }
+      try {
+        const ws = new WebSocket(`ws://127.0.0.1:${$("port").value || 8765}`);
+        ctlWs = ws;
+        ws.onopen = () => { ctlRetry = 1000; };
+        ws.onmessage = (ev) => {
+          let m; try { m = JSON.parse(ev.data); } catch { return; }
+          if (m.type === "swarm") applyPhase(m.state);
+        };
+        ws.onclose = () => { ctlWs = null; setTimeout(ctlConnect, Math.min(ctlRetry *= 1.5, 4000)); };
+        ws.onerror = () => { try { ws.close(); } catch {} };
+      } catch {}
+    });
   }
   ctlConnect();
+
+  // engine-mode phase mirror: swarm-engine.js writes { type:"swarm", state } to
+  // storage.local on every transition — watch it and reflect it in the UI.
+  chrome.storage.onChanged.addListener((ch, area) => {
+    if (area === "local" && ch.swarmState?.newValue?.type === "swarm") {
+      applyPhase(ch.swarmState.newValue.state);
+      const t = ch.swarmState.newValue.turn || 0;
+      const totalTurns = clamp($("turns").value || 6, 1, 50) * 2;
+      $("pbar").style.width = Math.min(100, Math.round(t / totalTurns * 100)) + "%";
+      $("ptext").textContent = t ? `${t}/${totalTurns} messages` : "";
+      if (t > 0) { launched = true; setStep(3); }
+    }
+  });
+  // initial read of the mirror (popup may open mid-run)
+  chrome.storage.local.get({ swarmState: null }, ({ swarmState }) => {
+    if (swarmState?.state) applyPhase(swarmState.state);
+  });
+
+  function currentMode() { return $("bridge-mode").value === "remote" ? "remote" : "engine"; }
 
   function applyPhase(ph) {
     const startBtn = $("start-run"), stopBtn = $("stop-run");
     startBtn.disabled = ph !== "armed";
-    startBtn.textContent = ph === "armed" ? "▶ Start swarm" : "▶ Start swarm";
+    startBtn.textContent = "▶ Start swarm";
     stopBtn.hidden = ph !== "running";
-    if (ph === "armed") setHint("Orchestrator is ARMED and waiting — press ▶ Start swarm (topic below is used).", "ok");
+    if (ph === "armed") setHint(currentMode() === "engine"
+      ? "In-browser engine is ARMED and waiting — press ▶ Start swarm." 
+      : "Orchestrator is ARMED and waiting — press ▶ Start swarm (topic below is used).", "ok");
     if (ph === "running") { setHint("Swarm running — watch it in the 📟 monitor.", "ok"); launched = true; setStep(3); }
-    if (ph === "done") setHint("Run finished. Transcript saved next to orchestrator.py.", "ok");
+    if (ph === "done") setHint(currentMode() === "engine"
+      ? "Run finished. Transcript saved in the extension — use ⬇ Export transcript."
+      : "Run finished. Transcript saved next to orchestrator.py.", "ok");
   }
 
   $("start-run").onclick = () => {
+    if (currentMode() === "engine") {
+      chrome.runtime.sendMessage({ type: "start", topic: $("topic").value.trim(),
+                                   turns: clamp($("turns").value, 1, 50) });
+      act("▶ start sent to in-browser engine");
+      $("start-run").disabled = true;
+      return;
+    }
     if (ctlWs?.readyState !== 1) { setHint("Can't reach the orchestrator yet — did you press 🖥️ Start orchestrator (or run python orchestrator.py)?", "err"); return; }
     ctlWs.send(JSON.stringify({ type: "start", topic: $("topic").value.trim(), turns: clamp($("turns").value, 1, 50) }));
     act("▶ start sent from popup with popup topic (" + $("topic").value.trim().length + " chars)");
     $("start-run").disabled = true;
   };
   $("stop-run").onclick = () => {
+    if (currentMode() === "engine") { chrome.runtime.sendMessage({ type: "stop" }); act("■ stop sent to in-browser engine"); return; }
     if (ctlWs?.readyState === 1) { ctlWs.send(JSON.stringify({ type: "stop" })); act("■ stop sent from popup"); }
   };
 
@@ -155,8 +243,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       tabsEl.appendChild(li);
       try {
         const st = await chrome.tabs.sendMessage(tab.id, { type: "status" });
-        li.querySelector(".st").textContent = `${st.state} · ${st.turns}x${st.wsOpen ? "" : " · ws down"}`;
-        if (st.wsOpen && st.state !== "halted") up++;
+        const engineMode = $("bridge-mode").value !== "remote";
+        const connected = engineMode ? true : !!st.wsOpen;   // engine mode: runtime channel is always live once registered
+        li.querySelector(".st").textContent = `${st.state} · ${st.turns}x${connected ? "" : " · orchestrator link down"}`;
+        if (connected && st.state !== "halted") up++;
         if (st.state === "halted") li.classList.add("halted");
         else if (st.state === "idle") li.classList.add("idle");
       } catch {

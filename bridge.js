@@ -6,6 +6,29 @@
 let WS_URL = "ws://127.0.0.1:8765";   // re-derived from the saved port below
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ── TRANSPORT ABSTRACTION (v0.9) ────────────────────────────────────────────
+// Two ways to reach an orchestrator:
+//   • "engine": the in-browser swarm-engine.js service worker (python-free
+//     default) — chrome.runtime messaging, no sockets, no localhost.
+//   • "ws": a remote orchestrator.py over ws://127.0.0.1:<port>.
+// Both expose the same frame vocabulary: register / say / reply / send_failed
+// / error / start / stop / halted / clear_input / state / swarm.
+let transport = null;                 // { mode, send(obj), alive() }
+function setEngineTransport() {
+  transport = {
+    mode: "engine",
+    send(obj) { try { chrome.runtime.sendMessage({ ...obj, agent: CFG.name }); } catch {} },
+    alive() { return true; },
+  };
+}
+function setWsTransport(ws) {
+  transport = {
+    mode: "ws",
+    send(obj) { try { ws.readyState === 1 && ws.send(JSON.stringify(obj)); } catch {} },
+    alive() { return ws.readyState === 1; },
+  };
+}
+
 // ── DEBUG LOG ────────────────────────────────────────────────────────────────
 // Every action is timestamped into a 300-entry ring buffer. Copy it with one
 // click (HUD 📋 button) or from the console: __lbLog(). Sent to the orchestrator
@@ -17,7 +40,7 @@ function lbLog(level, msg, data) {
   LB_LOG.push(e); if (LB_LOG.length > 300) LB_LOG.shift();
   (level === "ERROR" ? console.warn : console.log)(`[Shoarma ${e.agent}] ${level}: ${msg}`, data ?? "");
   try { chrome.runtime.sendMessage({ type: "log", entry: e }); } catch {}
-  try { state.ws?.readyState === 1 && state.ws.send(JSON.stringify({ type: "log", agent: e.agent, level, msg, data: e.data })); } catch {}
+  try { transport?.send({ type: "log", agent: e.agent, level, msg, data: e.data }); } catch {}
 }
 globalThis.__lbLog = () => LB_LOG.map(e => `${e.ts} ${e.level.padEnd(5)} ${e.msg}${e.data !== undefined ? " :: " + JSON.stringify(e.data).slice(0, 300) : ""}`).join("\n");
 
@@ -61,10 +84,10 @@ if (!CFG) {
   //    the monitor shows exactly what every tab's pill shows. ─────────────────
   function feedMonitor(label) {
     try {
-      state.ws?.readyState === 1 && state.ws.send(JSON.stringify({
+      transport?.send({
         type: "state", agent: CFG.name, state: label.toLowerCase().replace(/…/g, "").trim(),
         turns: state.turns,
-      }));
+      });
     } catch {}
   }
 
@@ -434,6 +457,9 @@ if (!CFG) {
     }
     if (!submitted) {
       lbLog("ERROR", "MESSAGE NOT SUBMITTED — text still sits in the input box after every channel", { preview: readBox(el).trim().slice(0, 60), hidden: document.hidden });
+      // v0.9: tell the orchestrator/engine explicitly so it can cool down and
+      // re-dispatch instead of us throwing a generic error mid-turn.
+      try { transport?.send({ type: "send_failed", agent: CFG.name, preview: readBox(el).trim().slice(0, 80) }); } catch {}
       throw new Error("LLM Bridge: message not submitted");   // v0.8.2: FAIL LOUDLY
     }
     lbLog("DEBUG", "message submitted (input box emptied)");
@@ -699,10 +725,13 @@ if (!CFG) {
     state.halted = typeof force === "boolean" ? force : !state.halted;
     hudEl.querySelector(".lb-danger").classList.toggle("lb-on", state.halted);
     hud(state.halted ? "HALTED" : "idle");
-    try { chrome.runtime.sendMessage({ type: "halted", halted: state.halted }); } catch {}
-    // v0.8.1: tell the orchestrator too — it now holds ALL dispatch while any
-    // agent halts, so the debate can't keep typing into the other tab.
-    try { sendCtl({ type: "halted", halted: state.halted }); } catch {}
+    if (transport?.mode === "ws") {
+      // v0.8.1: remote orchestrator needs an explicit frame — it holds ALL
+      // dispatch while any agent halts, so the debate can't keep typing into
+      // the other tab. In engine mode the runtime message below IS the engine.
+      try { sendCtl({ type: "halted", halted: state.halted }); } catch {}
+    }
+    try { chrome.runtime.sendMessage({ type: "halted", halted: state.halted, reason: "local" }); } catch {}
   }
   addEventListener("keydown", (e) => {              // Esc works even mid-flight
     if (e.key === "Escape") { e.stopPropagation(); toggleHalt(); }
@@ -726,8 +755,8 @@ if (!CFG) {
   //    ▶ button on ANY connected pill (or the popup's Start) fires it, carrying
   //    the saved popup Topic + Turns so the question you typed is honored. ────
   function sendCtl(obj) {
-    if (state.ws?.readyState === 1) { state.ws.send(JSON.stringify(obj)); return true; }
-    lbLog("WARN", "cannot " + obj.type + " — not connected to orchestrator yet"); return false;
+    if (transport?.alive()) { transport.send(obj); return true; }
+    lbLog("WARN", "cannot " + obj.type + " — no orchestrator transport is live yet"); return false;
   }
   function startSwarm() {
     chrome.storage.sync.get({ topic: "", turns: 6 }, (cfg) => {
@@ -739,105 +768,158 @@ if (!CFG) {
   }
   function stopSwarm() { if (sendCtl({ type: "stop" })) lbLog("INFO", "■ stop sent from HUD"); }
 
-  // ── Connection ─────────────────────────────────────────────────────────────
-  let backoff = 1000;
-  function connect() {
-    const ws = new WebSocket(WS_URL);
-    state.ws = ws;
-    hud("connecting…");
+  // ── Turn runner — shared by BOTH transports (v0.9) ───────────────────────
+  // Extracted from the old ws.onmessage so the in-browser engine can drive the
+  // exact same turn logic over chrome.runtime messages. Returns {queued:true}
+  // when a say arrives while a turn is still in flight (single-flight guard).
+  async function runTurn(text) {
+    const t0 = performance.now();
+    lbLog("INFO", `turn #${state.turns + 1}: received prompt`, { chars: String(text).length, preview: String(text).slice(0, 80) });
+    hud("writing…");
+    let textToSay = String(text);
+    let textP = "(no response captured)";
+    try {
+      for (;;) {
+        const baseline = assistantNodes().length;      // bubble count BEFORE send
+        await say(textToSay);
+        hud("thinking…");
+        await waitForStart(15000, baseline);           // stop button OR new bubble
+        await waitForIdle();
+        textP = await captureReply(baseline);          // + truncation re-check
+        if (textP !== "(no response captured)" || !pendingSay) break;
+        textToSay = pendingSay;                        // failed phantom turn — resend what we have queued
+        pendingSay = null;
+      }
+      state.turns++;
+      state.lastMs = performance.now() - t0;
+      lbLog("INFO", `turn #${state.turns} complete`, { seconds: +(state.lastMs / 1000).toFixed(1), replyChars: textP.length });
+      hud("idle");
+      transport?.send({ type: "reply", agent: CFG.name, text: textP });
+    } catch (e) {
+      lbLog("ERROR", "turn FAILED", { error: String(e), stack: String(e.stack).split("\n").slice(0, 3).join(" | ") });
+      hud("error");
+      transport?.send({ type: "error", agent: CFG.name, text: String(e) });
+    } finally {
+      busy = false;
+      if (pendingSay && !state.halted) {               // drain queued say after failure/idle capture
+        const q = pendingSay; pendingSay = null;
+        lbLog("INFO", "draining queued say", { chars: q.length });
+        handleOrchestratorFrame({ type: "say", text: q });
+      }
+    }
+  }
 
-    ws.onopen = () => {
-      backoff = 1000;                                 // reset on success
-      lbLog("INFO", "websocket connected → registering as " + CFG.name, { url: WS_URL });
-      ws.send(JSON.stringify({ type: "register", agent: CFG.name }));
+  function handleOrchestratorFrame(msg) {              // msg already parsed
+    if (msg.type === "clear_input") {                  // v0.8.3: flush a jammed editor before retrying
+      try {
+        const el = findInput();
+        if (el && readBox(el).trim()) {
+          setNativeValue(el, "");
+          if (isCE(el)) { try { document.execCommand("selectAll"); document.execCommand("delete"); } catch {} }
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
+          lbLog("INFO", "clear_input: flushed stuck text from input box", { chars: String(msg.text || "").length });
+        } else {
+          lbLog("DEBUG", "clear_input: box already empty");
+        }
+      } catch (e) { lbLog("WARN", "clear_input failed", { err: String(e).slice(0, 100) }); }
+      return;
+    }
+    if (msg.type === "registered") {                   // v0.9: engine acknowledged us
+      lbLog("INFO", "registered with in-browser swarm engine", { agent: msg.agent });
       hudEl.querySelector("#lb-start").hidden = false;
       hud("ready · press ▶");
-      try { chrome.runtime.sendMessage({ type: "agent-count" }); } catch {}
-    };
-
-    ws.onmessage = async (ev) => {
-      let msg; try { msg = JSON.parse(ev.data); } catch (e) { lbLog("ERROR", "bad frame from orchestrator (JSON parse)", { raw: String(ev.data).slice(0, 200), err: String(e) }); return; }
-      if (msg.type === "clear_input") {                // v0.8.3: orchestrator asks us to flush a jammed editor before retrying
-        try {
-          const el = findInput();
-          if (el && readBox(el).trim()) {
-            setNativeValue(el, "");
-            if (isCE(el)) { try { document.execCommand("selectAll"); document.execCommand("delete"); } catch {} }
-            el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
-            lbLog("INFO", "clear_input: flushed stuck text from input box", { chars: String(msg.text || "").length });
-          } else {
-            lbLog("DEBUG", "clear_input: box already empty");
-          }
-        } catch (e) { lbLog("WARN", "clear_input failed", { err: String(e).slice(0, 100) }); }
-        return;
-      }
-      if (msg.type === "resume") { lbLog("INFO", "orchestrator mid-run — tab rejoined"); hud("thinking…"); return; }
-      if (msg.type === "swarm") {                      // armed/running/done mirror
-        state.swarm = msg.state;
-        hudEl.querySelector("#lb-start").hidden = msg.state !== "armed";
-        hudEl.querySelector("#lb-stop").hidden = msg.state !== "running";
-        if (msg.state === "armed") hud("ready · press ▶");
-        if (msg.state === "done") hud("idle");
-        if (msg.state === "halted" && !state.halted) hud("idle · halted elsewhere ⏸");
-        return;
-      }
-      if (msg.type !== "say" || state.halted) { if (state.halted && msg.type === "say") lbLog("WARN", "dropping incoming say while HALTED", { preview: String(msg.text).slice(0, 60) }); return; }
-
-      const t0 = performance.now();
-      lbLog("INFO", `turn #${state.turns + 1}: received prompt`, { chars: String(msg.text).length, preview: String(msg.text).slice(0, 80) });
-      if (busy) {                                      // v0.8.3: single-flight guard.
-        lbLog("WARN", "say arrived while a turn is still in flight — queueing behind it",
-              { preview: String(msg.text).slice(0, 40) });
-        pendingSay = String(msg.text);                 // keep only the newest; older dupes were the retry storm
-        return;
-      }
-      busy = true;
-      try {
-        hud("writing…");
-        let textToSay = String(msg.text);
-        let textP = "(no response captured)";
-        for (;;) {
-          const baseline = assistantNodes().length;    // bubble count BEFORE send
-          await say(textToSay);
-          hud("thinking…");
-          await waitForStart(15000, baseline);         // stop button OR new bubble
-          await waitForIdle();
-          textP = await captureReply(baseline);        // + truncation re-check
-          if (textP !== "(no response captured)" || !pendingSay) break;
-          textToSay = pendingSay;                      // failed phantom turn — resend what we have queued
-          pendingSay = null;
-        }
-        state.turns++;
-        state.lastMs = performance.now() - t0;
-        lbLog("INFO", `turn #${state.turns} complete`, { seconds: +(state.lastMs / 1000).toFixed(1), replyChars: textP.length });
-        hud("idle");
-        ws.send(JSON.stringify({ type: "reply", agent: CFG.name, text: textP }));
-      } catch (e) {
-        lbLog("ERROR", "turn FAILED", { error: String(e), stack: String(e.stack).split("\n").slice(0, 3).join(" | ") });
-        hud("error");
-        ws.send(JSON.stringify({ type: "error", agent: CFG.name, text: String(e) }));
-      } finally {
-        busy = false;
-        if (pendingSay && !state.halted) {             // drain queued say after failure/idle capture
-          const q = pendingSay; pendingSay = null;
-          lbLog("INFO", "draining queued say", { chars: q.length });
-          ws.onmessage({ data: JSON.stringify({ type: "say", text: q }) });
-        }
-      }
-    };
-
-    ws.onclose = (ev) => { lbLog("WARN", `websocket closed (code ${ev.code}) — retrying in ${Math.round(backoff / 1000)}s`, { url: WS_URL });
-                           hud("connecting…"); setTimeout(connect, backoff);
-                           backoff = Math.min(backoff * 2, 15000); };
-    ws.onerror = () => ws.close();
+      return;
+    }
+    if (msg.type === "resume") { lbLog("INFO", "orchestrator mid-run — tab rejoined"); hud("thinking…"); return; }
+    if (msg.type === "swarm") {                        // armed/running/done mirror
+      state.swarm = msg.state;
+      hudEl.querySelector("#lb-start").hidden = msg.state !== "armed";
+      hudEl.querySelector("#lb-stop").hidden = msg.state !== "running";
+      if (msg.state === "armed") hud("ready · press ▶");
+      if (msg.state === "done") hud("idle");
+      if (msg.state === "halted" && !state.halted) hud("idle · halted elsewhere ⏸");
+      return;
+    }
+    if (msg.type === "engine-log") {                   // mirror engine lines into our ring buffer
+      const e = msg.entry || {};
+      LB_LOG.push({ ts: new Date(e.ts || Date.now()).toISOString().slice(11, -5), agent: "engine",
+                    level: e.level || "INFO", msg: e.msg || "", ...(e.data !== undefined ? { data: e.data } : {}) });
+      if (LB_LOG.length > 300) LB_LOG.shift();
+      return;
+    }
+    if (msg.type !== "say" || state.halted) { if (state.halted && msg.type === "say") lbLog("WARN", "dropping incoming say while HALTED", { preview: String(msg.text).slice(0, 60) }); return; }
+    if (busy) {                                        // v0.8.3: single-flight guard.
+      lbLog("WARN", "say arrived while a turn is still in flight — queueing behind it",
+            { preview: String(msg.text).slice(0, 40) });
+      pendingSay = String(msg.text);                   // keep only the newest; older dupes were the retry storm
+      return;
+    }
+    busy = true;
+    runTurn(msg.text);
   }
+
+  // ── Connection ─────────────────────────────────────────────────────────────
+  // v0.9: default transport is the in-browser swarm engine (python-free).
+  // If the user points us at a port AND enables remote mode, we use the
+  // classic WebSocket to orchestrator.py instead. Engine-first means zero
+  // localhost sockets unless explicitly asked for.
+  let backoff = 1000;
+  function connectEngineMode() {
+    setEngineTransport();
+    hud("connecting…");
+    transport.send({ type: "register", agent: CFG.name });
+    try { chrome.runtime.sendMessage({ type: "agent-count" }); } catch {}
+  }
+  function connect() {
+    chrome.storage.sync.get({ bridgeMode: "engine" }, ({ bridgeMode }) => {
+      if (bridgeMode === "engine") { connectEngineMode(); return; }
+      const ws = new WebSocket(WS_URL);
+      state.ws = ws;
+      setWsTransport(ws);
+      hud("connecting…");
+
+      ws.onopen = () => {
+        backoff = 1000;                                 // reset on success
+        lbLog("INFO", "websocket connected → registering as " + CFG.name, { url: WS_URL });
+        ws.send(JSON.stringify({ type: "register", agent: CFG.name }));
+        hudEl.querySelector("#lb-start").hidden = false;
+        hud("ready · press ▶");
+        try { chrome.runtime.sendMessage({ type: "agent-count" }); } catch {}
+      };
+
+      ws.onmessage = async (ev) => {
+        let msg; try { msg = JSON.parse(ev.data); } catch (e) { lbLog("ERROR", "bad frame from orchestrator (JSON parse)", { raw: String(ev.data).slice(0, 200), err: String(e) }); return; }
+        handleOrchestratorFrame(msg);
+      };
+
+      ws.onclose = (ev) => { lbLog("WARN", `websocket closed (code ${ev.code}) — retrying in ${Math.round(backoff / 1000)}s`, { url: WS_URL });
+                             hud("connecting…"); setTimeout(connect, backoff);
+                             backoff = Math.min(backoff * 2, 15000); };
+      ws.onerror = () => ws.close();
+    });
+  }
+
+  // v0.9: runtime message listener for engine-mode frames (chrome.runtime path)
+  try {
+    chrome.runtime.onMessage.addListener((m, _s, respond) => {
+      if (!m) return;
+      if (["say", "swarm", "clear_input", "registered", "resume", "engine-log"].includes(m.type)) {
+        handleOrchestratorFrame(m);
+        respond({ ok: true, queued: busy });
+        return true;
+      }
+      if (m?.type === "halted" && typeof m.halted === "boolean" && m.reason !== "local") {
+        toggleHalt(m.halted); respond({ ok: true }); return true;
+      }
+    });
+  } catch {}
 
   // ── Control deck asks: "how do you feel?" (popup tab-roster) ──────────────
   try {
     chrome.runtime.onMessage.addListener((m, _s, respond) => {
       if (m?.type === "status") respond({
         agent: CFG.name, state: state.lastState, turns: state.turns,
-        wsOpen: state.ws?.readyState === 1, halted: state.halted,
+        wsOpen: transport?.alive() ?? false, halted: state.halted, transport: transport?.mode || "none",
       });
       else if (m?.type === "halt") toggleHalt(!!m.halted);
       return true;

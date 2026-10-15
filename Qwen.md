@@ -174,3 +174,15 @@ Report the PR URL back to the user.
 - The live-run log of 2026-10-15 14:43–15:05 still showed a spiral: concurrent `say` frames racing on one shared input box, phantom captures of the previous turn's bubble after failed sends, and instant retry storms against a jammed editor + rate-limited site.
 - v0.8.3 fixes (this): single-flight turn guard with newest-only queue in bridge.js; baseline slice + stale-reply guard (`lastCapturedNorm`) in lastAssistantText; `clear_input` frame handled by bridge and sent by orchestrator `cool_down()` between ask_robust retries (5 s/10 s pacing). All verified: node --check, py_compile, and a scripted test proving looks_junk guards, clear_input dispatch, cooldown timing, and ask_robust recovery-on-attempt-2.
 - Branch `shoarma-v0.8-full` carries these commits; PR #2 remains open; main untouched per safety rules.
+
+## v0.9.0 — browser-native swarm engine + "meat" icon (2026-10-16)
+- PAT re-supplied by user; stored in gitignored `.env` as `GITHUB_TOKEN` (never committed).
+  Remote per this file: `origin = https://github.com/Esrevorter/Shoarma.git`.
+- New `swarm-engine.js` service worker: the A↔B conversation loop now runs entirely
+  in-browser (no external Python orchestrator required); manifest background points
+  at it; bridge/monitor/popup updated to match; version → 0.9.0.
+- Icons redesigned to match the name: a doner/shawarma concept (spice-red rounded
+  tile, stacked layered meat on a skewer with charred cap, pita wrap, pickle/tomato,
+  garlic-sauce drip), generated programmatically with Pillow at 16/48/128 px.
+- Verified: `node --check` on all five JS files; manifest JSON valid; PNGs decode at
+  correct sizes with transparent corners.

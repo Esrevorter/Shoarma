@@ -1,0 +1,57 @@
+# Shoarma CI — builds a ready-to-load Chrome extension zip on every push/PR,
+# and publishes it to the Release matching the manifest version tag (vX.Y.Z).
+name: build-extension
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # only used for tagged releases
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from manifest.json
+        id: ver
+        run: |
+          V=$(python -c "import json;print(json.load(open('manifest.json'))['version'])")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "building LLM Bridge v$V"
+
+      - name: Validate manifest + syntax-check sources
+        run: |
+          python -m json.tool manifest.json > /dev/null
+          node --check bridge.js
+          node --check popup.js
+          node --check background.js
+          python -m py_compile orchestrator.py launcher.py scripts/*.py
+          echo "✔ all sources valid"
+
+      - name: Package extension (flat zip — unzip → chrome://extensions → Load unpacked)
+        run: |
+          mkdir -p dist
+          zip -r "dist/shoarma-extension-v${{ steps.ver.outputs.version }}.zip" \
+            manifest.json bridge.js hud.css popup.html popup.css popup.js \
+            background.js orchestrator.py icons/ launcher/ \
+            -x "*.DS_Store"
+          unzip -l "dist/shoarma-extension-v${{ steps.ver.outputs.version }}.zip"
+
+      - name: Upload artifact (any branch/PR)
+        uses: actions/upload-artifact@v4
+        with:
+          name: shoarma-extension-v${{ steps.ver.outputs.version }}
+          path: dist/*.zip
+
+      - name: Attach zip to GitHub Release (only on v* tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

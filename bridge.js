@@ -1,8 +1,8 @@
 // bridge.js — one instance per LLM tab. Each instance = one agent node.
-// v0.2: faster cadence, event-driven generation detection, sleek glass HUD,
-//       keyboard HALT (Esc), live turn stats, minimal reconnect backoff.
+// v0.3: settings come from the popup (chrome.storage.sync, live updates),
+//       HUD injected via manifest css, status reported to the control deck.
 
-const WS_URL = "ws://127.0.0.1:8765";
+let WS_URL = "ws://127.0.0.1:8765";   // re-derived from the saved port below
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ── PER-SITE SELECTORS. You WILL need to inspect the DOM and fix these. ──
@@ -29,7 +29,22 @@ if (!CFG) {
   // Defensive: content script injected on a host we don't know how to drive.
   console.warn("LLM Bridge: no site config for", location.hostname);
 } else {
-  const state = { halted: false, ws: null, turns: 0, lastMs: 0 };
+  const state = { halted: false, ws: null, turns: 0, lastMs: 0, lastState: "connecting" };
+
+  // ── Settings from the popup UI (chrome.storage.sync). Live: change a value
+  //    in the control deck and this tab reacts without a reload. ─────────────
+  chrome.storage.sync.get({ port: 8765, halted: false }, (saved) => {
+    WS_URL = `ws://127.0.0.1:${saved.port}`;
+    if (saved.halted) toggleHalt(true);
+  });
+  chrome.storage.onChanged.addListener((ch, area) => {
+    if (area !== "sync") return;
+    if (ch.port && ch.port.newValue) {
+      const next = `ws://127.0.0.1:${ch.port.newValue}`;
+      if (next !== WS_URL) { WS_URL = next; try { state.ws?.close(); } catch {} connect(); }
+    }
+    if (ch.halted && !!ch.halted.newValue !== state.halted) toggleHalt(ch.halted.newValue);
+  });
 
   // ── The single most important function in this entire project ──────────────
   // These are React apps. Setting el.value = "..." does NOTHING — React's
@@ -103,8 +118,8 @@ if (!CFG) {
   // ── HUD: glassmorphic pill with live state, turn stats and a KILL SWITCH.
   //    Runaway loops are the #1 failure mode; never build this without one. ──
   const hudEl = (() => {
-    const css = chrome?.runtime?.getURL
-      ? chrome.runtime.getURL("hud.css") : null;   // falls back to inline below
+    // v0.3: hud.css is injected by the manifest content_scripts entry —
+    // no web-accessible <link> hack needed anymore.
     const box = document.createElement("div");
     box.id = "__lb_hud";
     box.className = "lb-connecting";
@@ -115,24 +130,22 @@ if (!CFG) {
       <span class="lb-stats"></span>
       <button class="lb-btn lb-danger" title="Halt / resume (Esc)">HALT</button>
       <button class="lb-btn" title="Collapse">—</button>`;
-    if (css) { const l = document.createElement("link");
-               l.rel = "stylesheet"; l.href = css; box.prepend(l); }
-    else { box.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;" +
-           "background:#111a;color:#e8edf4;font:12px monospace;padding:10px 14px;" +
-           "border-radius:14px;border:1px solid #fff2;opacity:.9"; }
-    const style = document.createElement("style");
-    style.textContent = `#__lb_hud{font-family:system-ui,sans-serif}`;
-    box.appendChild(style);
+    // inline fallback in case the page's CSP blocks the content-script stylesheet
+    box.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;" +
+      "display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:14px;" +
+      "background:#111a;color:#e8edf4;font:500 12px system-ui,sans-serif;" +
+      "border:1px solid #fff2;opacity:.9";
     document.body.appendChild(box);
-    box.querySelector(".lb-danger").onclick = toggleHalt;
+    box.querySelector(".lb-danger").onclick = () => toggleHalt();
     box.querySelectorAll(".lb-btn")[1].onclick = () => box.classList.toggle("lb-min");
     return box;
   })();
 
-  function toggleHalt() {
-    state.halted = !state.halted;
+  function toggleHalt(force) {
+    state.halted = typeof force === "boolean" ? force : !state.halted;
     hudEl.querySelector(".lb-danger").classList.toggle("lb-on", state.halted);
     hud(state.halted ? "HALTED" : "idle");
+    try { chrome.runtime.sendMessage({ type: "halted", halted: state.halted }); } catch {}
   }
   addEventListener("keydown", (e) => {              // Esc works even mid-flight
     if (e.key === "Escape") { e.stopPropagation(); toggleHalt(); }
@@ -141,8 +154,9 @@ if (!CFG) {
   const STATE_CLASS = ["connecting","ready","writing","thinking","idle","error","halted"];
   function hud(label) {
     // keep any collapse state, swap exactly one lb-<state> class
+    state.lastState = label.toLowerCase().replace(/…/g, "").trim();
     const min = hudEl.classList.contains("lb-min") ? " lb-min" : "";
-    hudEl.className = "__lb_hud" + min;
+    hudEl.className = ("lb-connecting" + min).trim();
     const key = label.toLowerCase();
     for (const s of STATE_CLASS) if (key.startsWith(s)) hudEl.classList.add("lb-" + s);
     hudEl.querySelector(".lb-state").textContent = label;
@@ -161,6 +175,7 @@ if (!CFG) {
       backoff = 1000;                                 // reset on success
       ws.send(JSON.stringify({ type: "register", agent: CFG.name }));
       hud("ready");
+      try { chrome.runtime.sendMessage({ type: "agent-count" }); } catch {}
     };
 
     ws.onmessage = async (ev) => {
@@ -189,6 +204,18 @@ if (!CFG) {
                          backoff = Math.min(backoff * 2, 15000); };
     ws.onerror = () => ws.close();
   }
+
+  // ── Control deck asks: "how do you feel?" (popup tab-roster) ──────────────
+  try {
+    chrome.runtime.onMessage.addListener((m, _s, respond) => {
+      if (m?.type === "status") respond({
+        agent: CFG.name, state: state.lastState, turns: state.turns,
+        wsOpen: state.ws?.readyState === 1, halted: state.halted,
+      });
+      else if (m?.type === "halt") toggleHalt(!!m.halted);
+      return true;
+    });
+  } catch {}
 
   connect();
 }

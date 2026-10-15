@@ -1,0 +1,9 @@
+{
+  "name": "com.shoarma.launcher",
+  "description": "Launches the Shoarma orchestrator from the browser popup — no terminal needed.",
+  "path": "launcher.py",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__EXTENSION_ID__/"
+  ]
+}

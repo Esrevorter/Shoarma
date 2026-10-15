@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="icons/icon128.png" alt="Shoarma" width="96" />
+
 # 🌯 SHOARMA
 
 ### **Zero budget. Two AIs. One argument. Your browser does the talking.**
@@ -8,11 +10,11 @@
 
 <br/>
 
-**⚡ $0/mo &nbsp;·&nbsp; 🔒 0 permissions &nbsp;·&nbsp; 🧠 uses the chat UIs you already log into &nbsp;·&nbsp; 🛑 one-click HALT**
+**⚡ $0/mo · 🔒 no host permissions · 🖱️ point-and-click control deck · 🛑 one-key HALT**
 
 <br/>
 
-[What it is](#-what-shoarma-is) · [Architecture](#-architecture) · [Install](#-installation) · [Run it](#-running-your-first-swarm) · [End-user guide](#-end-user-overview) · [Troubleshooting](#-troubleshooting)
+[What it is](#-what-shoarma-is) · [Install in 3 clicks](#-install-the-extension) · [Control deck](#-the-control-deck) · [CI builds](#-ci--packaged-builds) · [End-user guide](#-end-user-overview) · [Troubleshooting](#-troubleshooting)
 
 </div>
 
@@ -20,197 +22,175 @@
 
 ## 🥩 What Shoarma Is
 
-Shoarma is a tiny **chrome-extension swarm** that turns two (or more!) free, authenticated LLM web UIs — currently **Qwen** and **DeepSeek** — into autonomous conversational agents that talk *to each other*, on a loop, while you watch.
+Shoarma is a tiny **Chrome extension + Python referee** that turns two free, authenticated LLM web UIs — currently **Qwen** and **DeepSeek** — into autonomous conversational agents that argue *with each other*, on a loop, while you watch. No API keys, no quota purchases: it drives the chat websites you already log into, reusing your existing session.
 
-You already pay for these chats with your attention. Shoarma simply **reuses the session you're logged into**: the extension injects prompts into the page's own input box, waits for the reply to finish rendering, scrapes it out of the DOM, and hands it to the *other* model. A small Python process referees the conversation — routing messages, counting turns, and writing the transcript.
+The extension injects prompts into each page's own input box (React-safe), waits for the reply to finish rendering, scrapes it out of the DOM, and hands it to the *other* model through a localhost WebSocket. The Python orchestrator referees: routing messages, alternating turns, enforcing a hard turn cap, and streaming the transcript to disk.
 
-The result: genuine multi-model debates, brainstorm ping-pong, or red-team-vs-blue-team exchanges — **for exactly zero cents**, because every token is spent inside accounts you already have.
+**Since v0.3 you don't need a terminal to run it.** The toolbar popup is a full control deck — set the topic, number of turns, timeout and port there; hit **🚀 Launch swarm**; watch both tabs work. GitHub Actions builds a ready-to-use extension zip on every push.
 
-> **Why "Shoarma"?** Because it's cheap, filling, assembled from whatever meat (models) you have lying around, and best consumed while watching something happen live. 🌯
+> **Why "Shoarma"?** Cheap, filling, assembled from whatever meat (models) you have lying around, best consumed while watching something happen live. 🌯
 
 ### ✨ Bold claims, honestly kept
 
 | Claim | How it's actually true |
 |---|---|
-| **Zero cost** | No APIs, no keys, no quota purchases. The extension talks to the *websites*, using the Google login you already have. |
-| **Zero permissions** | `manifest.json` requests **nothing**. Not storage, not host permissions, not tabs. Content scripts may open WebSockets without grants — so Chrome asks you for nothing on install. |
-| **Zero babysitting your browser** | Unlike Playwright/Selenium approaches: no profile-path hacks, no closing your daily-driver browser, no CAPTCHA whack-a-mole. The extension *is* your browser, inheriting your session for free. |
-| **Zero MV3 service-worker deaths** | There is no background script at all. Each tab owns its WebSocket. Nothing to keep alive, nothing to resurrect. |
+| **Zero cost** | No APIs, no keys. The extension talks to the *websites*, using the logins you already have. |
+| **Zero host permissions** | `manifest.json` requests no host access, no tabs-read beyond two sites, nothing that shows a scary install warning. |
+| **Zero terminal required** | Popup → 🚀 Launch swarm (via an optional one-line native-host registration). Classic `python orchestrator.py` still works for everyone else. |
+| **Settings in the UI** | Topic, turns, timeout, port, global halt — all live in the popup, persisted with `chrome.storage.sync`, pushed to open tabs instantly. |
+| **CI-packaged** | Every push runs validation + packaging; tagged releases carry a zip you unzip and load. No repo cloning needed. |
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────┐        ┌─────────────────────────┐
-│  TAB 1: chat.qwen.ai    │        │  TAB 2: chat.deepseek.com│
-│  ┌───────────────────┐  │        │  ┌───────────────────┐   │
-│  │ bridge.js (agent) │  │        │  │ bridge.js (agent) │   │
-│  │ DOM read/write    │  │        │  │ DOM read/write    │   │
-│  └─────────┬─────────┘  │        │  └─────────┬─────────┘   │
-└────────────┼────────────┘        └────────────┼─────────────┘
-             │  ws://127.0.0.1:8765             │
-             └──────────────┬────────────────────┘
+┌─────────────────────────┐   ┌──────────────────────────┐
+│  TAB 1: chat.qwen.ai    │   │  TAB 2: chat.deepseek.com│
+│  bridge.js (agent node) │   │  bridge.js (agent node)  │
+│  glass HUD · Esc=HALT   │   │  glass HUD · Esc=HALT    │
+└────────────┬────────────┘   └────────────┬─────────────┘
+             │      ws://127.0.0.1:<port>  │
+             └──────────────┬──────────────┘
                             ▼
-              ┌──────────────────────────────┐
-              │  orchestrator.py (Python)    │
-              │  routes A→B→A, turn limits,  │
-              │  transcript logging          │
-              └──────────────────────────────┘
+        ┌───────────────────────────────┐   launched by either:
+        │  orchestrator.py (referee)    │◄── 🚀 popup → launcher.py (native host)
+        │  routes A→B→A · turn caps     │   or  $ python orchestrator.py
+        │  per-run transcripts + logs   │
+        └───────────────────────────────┘
+             ▲ settings flow both ways:
+        ┌────┴──────────┐   popup saves to chrome.storage.sync;
+        │  popup UI     │   bridge reacts live; scripts/sync-settings.py
+        │  control deck │   can export them for a manual CLI run
+        └───────────────┘
 ```
-
-**The key design decision:** each tab's content script (`bridge.js`) opens its **own WebSocket** to localhost and registers itself as a named node (`qwen`, `deepseek`). The Python server is deliberately dumb — a router and turn governor only. All intelligence (and all fragility-prone DOM work) stays in the page, where it can be fixed per-site without touching the core.
 
 ### 📁 Repository map
 
 | File | Role |
 |---|---|
-| `manifest.json` | The entire Chrome extension declaration. Deliberately permission-free. |
-| `bridge.js` | The agent node. One instance per tab: injects prompts (React-safe!), detects generation start/end, scrapes replies, shows a HUD with a **HALT kill switch**, auto-reconnects. |
-| `hud.css` | The HUD's look — glassmorphic pill, animated status dot, turn/latency stats. v0.2 design refresh. |
-| `orchestrator.py` | The referee. asyncio + websockets router, alternates turns qwen→deepseek, enforces a hard turn cap, saves `transcript.json`. Now with CLI flags: `--turns`, `--topic`, `--timeout`, `--port`. |
-| `SPEC.md` | The full architecture spec this repo implements — including the hard-won gotchas table. Read it before editing selectors. |
-| `Qwen.md` | Agent instructions for publishing this work to GitHub (done — see PR #1). |
+| `manifest.json` | Extension declaration (MV3). Content scripts on the two chat sites only. |
+| `bridge.js` | The agent node. Injects prompts, detects generation start/end, scrapes replies, HUD, Esc-HALT, reads popup settings live, answers status pings. |
+| `popup.html/css/js` | **The control deck** — topic/turns/timeout/port/halt, 🚀 one-click launch, live tab roster, download link for the referee. |
+| `background.js` | Service worker: spawns the orchestrator via the native launcher, badge = live agent count. |
+| `launcher.py` + `launcher/` | Native messaging host: lets the popup start `orchestrator.py` with your UI settings, logging to `Downloads/shoarma/`. |
+| `hud.css` | Glassmorphic HUD styling, injected as a content-script stylesheet (plus inline fallback). |
+| `orchestrator.py` | The referee. asyncio + websockets router, turn governor, `settings.json` support, per-run timestamped transcripts & logs, CLI flags. |
+| `scripts/install-launcher.py` | One-time native-host registration (macOS/Linux/Windows). |
+| `scripts/sync-settings.py` | Exports your popup settings from Chrome storage → `settings.json` for CLI runs. |
+| `.github/workflows/build-extension.yml` | CI: validates, packages the extension zip, publishes Releases on `v*` tags. |
+| `SPEC.md` | Original architecture spec — including the hard-won gotchas table. |
 
 ---
 
-## 🛠️ Installation
+## 📦 Install the extension
 
-**Prerequisites:** Google Chrome (or any Chromium browser), Python ≥ 3.10, and free accounts already logged in at [chat.qwen.ai](https://chat.qwen.ai) and [chat.deepseek.com](https://chat.deepseek.com). That's it.
+**Prerequisites:** Google Chrome (or any Chromium browser), Python ≥ 3.10, and free logged-in accounts at [chat.qwen.ai](https://chat.qwen.ai) and [chat.deepseek.com](https://chat.deepseek.com).
 
-### 1 — Get the code
+### Option A — the CI package (no git!) 😎
+
+1. Go to **Releases** → download `shoarma-extension-vX.Y.Z.zip` (built automatically by GitHub Actions).
+2. Unzip it anywhere.
+3. Open `chrome://extensions` → toggle **Developer mode** (top right) → **Load unpacked** → pick the unzipped folder.
+4. Pin the 🌯 icon to your toolbar. Done.
+
+*(Every commit also produces a build under the workflow run's **Artifacts** tab if you want the bleeding edge.)*
+
+### Option B — from the repo
+
+Clone/download this repo and **Load unpacked** pointing at the repo root. Same result.
+
+### Optional — one-click launch (skip the terminal forever)
+
+The popup's 🚀 button talks to a small native helper. Register it once:
 
 ```bash
-git clone https://github.com/Esrevorter/Shoarma.git
-cd Shoarma
+pip install websockets                       # the referee's only dependency
+python scripts/install-launcher.py <EXTENSION_ID>
 ```
 
-*(Or just download the repo as a ZIP — there is no build step. Nothing compiles. Nothing bundles.)*
+`<EXTENSION_ID>` is the 32-letter id shown under the extension on `chrome://extensions`. After that, 🚀 Launch swarm starts the orchestrator silently in the background; its output lands in `Downloads/shoarma/launcher.log`.
 
-### 2 — Install the one Python dependency
-
-```bash
-pip install websockets
-```
-
-### 3 — Load the extension
-
-1. Open `chrome://extensions`
-2. Toggle **Developer mode** on (top-right corner)
-3. Click **Load unpacked**
-4. Select the `Shoarma/` folder — the one containing `manifest.json`
-
-Done. Chrome will ask you for **no permissions whatsoever**. That's not an oversight; it's the design.
+> Without this step everything still works — the popup tells you exactly what to do, or run `python orchestrator.py` yourself.
 
 ---
 
-## ▶️ Running Your First Swarm
+## 🖱️ The Control Deck
 
-Order matters. Follow these four steps like a recipe:
+Click the 🌯 toolbar icon:
 
-```
- 1. python orchestrator.py          ← start the referee first
- 2. open both chat tabs             ← nodes connect & register themselves
- 3. watch the badges go green       ← [qwen] ready  ·  [deepseek] ready
- 4. …and enjoy the argument         ← transcript.json appears when it's done
-```
-
-1. **Start the orchestrator:**
-   ```bash
-   python orchestrator.py
-   ```
-   It prints `ws://127.0.0.1:8765 — open both tabs, waiting for {'qwen', 'deepseek'}` and politely waits.
-
-2. **Open `chat.qwen.ai` in one tab and `chat.deepseek.com` in another.** Both should already be logged in. `bridge.js` auto-connects and registers each tab as a named node.
-
-3. **Keep both tabs visible** — arrange two browser windows side by side. Chrome throttles hidden-tab timers to roughly one tick per minute, which will starve the reply-detection loop. Besides, watching them argue live is half the fun.
-
-4. **Watch the terminal.** The orchestrator seeds a debate (*"Is local-first AI more important than cloud AI?"*), then shuttles each reply to the other model for `TURNS = 6` rounds. When it finishes:
-
-   ```
-   saved 12 turns → transcript.json
-   ```
-
-That's a complete, coherent, cross-model debate transcript — generated entirely on free web tiers, from your own living browser session.
-
----
-
-## 👀 End-User Overview: What You'll Actually See
-
-**In each chat tab**, bottom-right, a glass HUD pill reports that agent's state — with a pulsing status dot (cyan = working, green = idle, amber = ready, red = halted/error), live turn/latency stats, and two buttons:
-
-| State | Meaning |
+| Control | What it does |
 |---|---|
-| `connecting…` | Trying to reach the orchestrator. Start `orchestrator.py`; retries back off 1 s → 15 s automatically. |
-| `ready` | Registered and awaiting orders. |
-| `writing…` | Injecting the prompt into the site's own text box. |
-| `thinking…` | Prompt submitted; waiting for generation to start, then for the DOM to go quiet (1.0 s debounce, 120 s hard cap). The pill shows `4x · 23.7s` — turns completed and last-turn latency. |
-| `idle` | Reply captured and handed back to the referee. |
-| `error` | Something failed (missing selector, blocked socket). Details went to the terminal, prefixed `ERR`. |
-| `HALTED` | You pressed the kill switch. This agent ignores all further prompts. |
+| **Topic** | The opening prompt for the debate. Leave empty for the built-in starter. |
+| **Turns / Timeout / Port** | Debate length, per-reply deadline, WebSocket port. Saved automatically. |
+| **🚀 Launch swarm** | Starts the referee with these exact settings (needs the optional launcher). |
+| **Halt all agents** | Global kill switch — freezes every tab instantly. Mirrors the HUD's HALT and the Esc key. |
+| **Live roster** | Each open chat tab with its state (`ready`, `writing…`, `idle`, `halted`) and turn count. |
 
-**Kill switch, twice over:** click **HALT** in the pill — or tap **Esc** anywhere on the page, even mid-generation — to stop that node instantly; repeat to release. The **`—`** button collapses the pill into a slim dot so it never covers the chat. The orchestrator also enforces a hard turn cap server-side, so runaway loops are structurally impossible.
+Settings are **live**: change the port or flip Halt and open tabs react without reloading. They persist across restarts via your Chrome profile.
 
-**In the terminal**, you get a live feed:
+---
 
-```
-[+] node online: qwen
-[+] node online: deepseek
-both agents online. starting.
+## ▶️ Running your first swarm
 
->>> qwen ← Let's debate: is local-first AI more important than cloud AI? Take a fi…
-<<< qwen: Local-first AI isn't a preference — it's a civilizational necessity.…
-------------------------------------------------------------
->>> deepseek ← Local-first AI isn't a preference — it's a civilizational necessit…
-<<< deepseek: With respect — necessity? You're romanticizing underpowered hardware…
-------------------------------------------------------------
-```
+1. Log into **chat.qwen.ai** and **chat.deepseek.com** in two side-by-side tabs.
+2. Each tab shows a glass pill bottom-right: `connecting…` → `ready` once the referee exists.
+3. Start the referee — **either**: click 🚀 in the popup, **or** run `python orchestrator.py` in a terminal.
+4. Watch: Qwen argues, DeepSeek rebuts, back and forth, `turn N done in X.Xs`.
+5. When it finishes, grab `transcript-<timestamp>.json` (+ a readable `.log`) from `Downloads/shoarma/` (or the repo dir for CLI runs).
 
-**Afterwards**, `transcript.json` holds every turn as `{turn, agent, seconds, text}` — ready to archive, diff, or feed anywhere else. It's streamed after *every* hop, so even a mid-run crash leaves the partial debate on disk.
+**Emergency brake:** press **Esc** in any tab, click **HALT**, or flip **Halt all agents** in the popup. Nothing is irreversible.
 
-### 🧪 Want to change the topic? Just pass a flag.
+---
 
-No editing required (v0.2): the orchestrator takes CLI flags —
+## 🧑‍💻 End-user overview (for the non-tech friend)
+
+You installed the zip and registered the launcher. From here on it's three moves:
+
+> **Open two chats → click 🌯 → type a topic → 🚀.**
+
+Then watch two AIs argue like it's a sport. The HUD dot tells you who's doing what:
+
+| Dot | Meaning |
+|---|---|
+| 🟦 pulsing cyan | injecting a prompt / waiting for the model to answer |
+| 🟢 green | idle — reply captured, waiting for the next message |
+| 🟡 amber | ready — connected to the referee, awaiting orders |
+| 🔴 red | halted or error — press Esc / HALT to stop, reload tab to reset |
+
+The popup badge number = how many agent tabs are alive. If it says `0/2 agent(s) wired`, reload the chat tabs.
+
+---
+
+## 🤖 CI & packaged builds
+
+`.github/workflows/build-extension.yml` runs on every push/PR:
+
+1. **Validate** — manifest JSON check + syntax-check every JS/Python source.
+2. **Package** — flat `shoarma-extension-vX.Y.Z.zip` (version read from `manifest.json`).
+3. **Publish** — artifact on every branch; on a `v*` tag, the zip attaches to a GitHub Release automatically.
+
+Cutting a release is literally:
 
 ```bash
-python orchestrator.py --turns 4 --topic "Let's trade haiku about retirement. One haiku each per turn. Qwen, open."
-python orchestrator.py --help          # --turns · --timeout · --topic · --port
+git tag v0.3.0 && git push origin v0.3.0    # → Release with downloadable zip appears
 ```
 
-The defaults still seed the classic debate (*"Is local-first AI more important than cloud AI?"*) for 6 rounds. Use `--topic` for a poem-passing game, a negotiation sim, or adversarial fact-checking. The plumbing doesn't care what the meat is. 🌯
+---
 
-### ➕ Want a third model? Add a tab.
+## 🔧 Troubleshooting
 
-Extend the `SITES` map in `bridge.js` and the match list in `manifest.json` (e.g. `kimi`, `grok`, `gemini`), add the name to `AGENTS_EXPECTED` in `orchestrator.py`, and open the tab. It joins the swarm automatically. At that point it's genuinely a heterogeneous agent swarm — running entirely on your existing authenticated sessions, at zero cost.
+| Symptom | Fix |
+|---|---|
+| HUD stuck on `connecting…` | Referee not running — 🚀 in the popup or `python orchestrator.py`. Check the popup **Port** matches. |
+| 🚀 says "One-time setup needed" | Run `python scripts/install-launcher.py <id>` once (see above). Or just use the terminal. |
+| Reply never arrives / `(no response captured)` | Site DOM changed — update selectors in `bridge.js` `SITES` (DevTools is your friend; see SPEC.md gotchas). |
+| Both tabs say `ready` but nothing happens | Someone pressed Esc/HALT — check the popup roster, flip Halt off. |
+| Port already in use | The referee refuses to double-bind; 🚀 detects this and tells you. Change **Port** in the popup. |
+| Want CLI runs to use my popup settings | `python scripts/sync-settings.py <id>` writes `settings.json`; the orchestrator picks it up automatically. |
 
 ---
 
-## ⚠️ Troubleshooting & Known Gotchas
+## 📜 License & lineage
 
-The single most common issue: **a site redesigned and broke the CSS selectors.** Expect to spend ~20 minutes per site in DevTools tuning the `SITES` map in `bridge.js`. Symptoms and fixes (full table in `SPEC.md`):
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| Send button never enables / prompt appears but nothing submits | React ignores plain `el.value =` assignments | Already solved: `setNativeValue()` — do not remove it. If broken, the `input`/`send` selectors changed. |
-| Both models echo the same stale text | Reply was scraped before the new bubble existed | `waitForStart()` must run before `waitForIdle()`; scope `bubbles` to assistant-only nodes. |
-| Replies take forever, hit the 120 s timeout | Background-tab throttling | Keep both tabs visible, side by side. |
-| `(no response captured)` | Selector matched nothing | Inspect the reply bubble, update `bubbles` — prefer `data-*`/`aria-*` over generated class names. |
-| `WebSocket connection failed` in console | Rare CSP block on the socket | Move the socket to a `chrome.offscreen` document and relay via runtime messages. Only if it actually happens. |
-| CAPTCHA appears | Free tier flagged mechanical cadence | Randomized delays are built in; keep `TURNS ≤ 8`; press HALT and let the account rest. |
-
-**Ethics note:** Shoarma automates *your own* sessions on services whose ToS may frown upon automation. Use it modestly, on your own accounts, for personal experiments — the turn caps and HALT switch exist for exactly that reason.
-
----
-
-## 📜 License & Credits
-
-Released under the terms in [`LICENSE`](LICENSE). Architecture, gotcha tables, and selector wisdom documented in [`SPEC.md`](SPEC.md) — treat it as the maintenance manual.
-
-### 🌯 Changelog highlights
-
-**v0.2 — the refinement pass**
-- **Faster:** snappier typing cadence (~150 ms vs ~350 ms), fast initial poll for generation-start detection (60 ms → adaptive), tighter 1.0 s idle debounce, scoped MutationObserver instead of body-wide, instant reconnect backoff reset.
-- **Sleeker:** glassmorphic HUD pill (`hud.css`) with animated status dot, per-state colors, live `turns · latency` stats, and a collapse button so it never covers the chat.
-- **Friendlier:** **Esc = HALT anywhere on the page**, CLI flags (`--turns`, `--topic`, `--timeout`, `--port`) so you change the debate without editing code, crash-proof streaming transcript with per-hop timings.
-
-**Built bold. Kept cheap. Seasoned to taste. 🌯**
+MIT — see `LICENSE`. Built from [`SPEC.md`](SPEC.md); [`Qwen.md`](Qwen.md) documents the publishing workflow. **v0.3** added the control-deck popup, one-click launch, CI packaging and per-run transcripts. Use responsibly: you're automating *your own* logged-in sessions; keep turn counts sane and be nice to the services hosting you. 🌯

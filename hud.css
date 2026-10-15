@@ -1,0 +1,78 @@
+/* hud.css — the LLM Bridge heads-up display. Glassmorphic, animated, unobtrusive. */
+
+#__lb_hud {
+  position: fixed;
+  bottom: 18px;
+  right: 18px;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  font: 500 12px/1.4 "Inter", "SF Pro Text", system-ui, sans-serif;
+  color: #e8edf4;
+  background: rgba(15, 18, 28, 0.72);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  opacity: 0.92;
+  transition: opacity .25s ease, transform .25s ease;
+  user-select: none;
+}
+#__lb_hud:hover { opacity: 1; transform: translateY(-1px); }
+#__lb_hud.lb-min { transform: translateX(calc(100% - 34px)); opacity: .55; }
+#__lb_hud.lb-min:hover { transform: translateX(0); opacity: 1; }
+
+.lb-dot {
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: #5a6069;
+  flex: none;
+  transition: background .3s ease, box-shadow .3s ease;
+}
+.lb-thinking .lb-dot, .lb-writing .lb-dot {
+  background: #4cc9f0;
+  box-shadow: 0 0 10px #4cc9f0;
+  animation: lb-pulse 1s ease-in-out infinite;
+}
+.lb-ready .lb-dot   { background: #ffd166; box-shadow: 0 0 8px #ffd166; }
+.lb-idle .lb-dot    { background: #2dd4a7; box-shadow: 0 0 8px #2dd4a7; }
+.lb-error .lb-dot, .lb-halted .lb-dot {
+  background: #ff5c7a; box-shadow: 0 0 10px #ff5c7a;
+  animation: lb-pulse .6s ease-in-out infinite;
+}
+@keyframes lb-pulse { 50% { opacity: .35; transform: scale(.8); } }
+
+.lb-agent {
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: #4cc9f0;
+}
+.lb-state { color: #aeb6c2; min-width: 84px; }
+.lb-stats { color: #6b7280; font-variant-numeric: tabular-nums; }
+
+.lb-btn {
+  all: unset;
+  cursor: pointer;
+  padding: 4px 10px;
+  border-radius: 8px;
+  font: inherit;
+  font-weight: 600;
+  color: #cbd3de;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  transition: background .15s ease;
+}
+.lb-btn:hover { background: rgba(255, 255, 255, 0.16); }
+.lb-btn.lb-danger:hover { background: rgba(255, 92, 122, .25); color: #ff8ba1; }
+.lb-btn.lb-on { background: rgba(255, 92, 122, .35); color: #ffb3c2; }
+
+/* v0.6 — clear primary actions on the pill */
+.lb-btn.lb-start { background: rgba(45, 212, 167, .22); border-color: rgba(45, 212, 167, .45); color: #7ef0cf; font-weight: 700; }
+.lb-btn.lb-start:hover { background: rgba(45, 212, 167, .38); }
+.lb-btn.lb-stop { background: rgba(255, 92, 122, .18); border-color: rgba(255, 92, 122, .4); color: #ff8ba1; }
+.lb-btn.lb-stop:hover { background: rgba(255, 92, 122, .32); }
+.lb-btn[hidden] { display: none; }

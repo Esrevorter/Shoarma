@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shoarma · Live Monitor</title>
+  <link rel="icon" href="icons/icon48.png" />
+  <link rel="stylesheet" href="monitor.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <img src="icons/icon48.png" alt="" width="30" height="30" />
+      <div>
+        <h1>Shoarma <span class="thin">live monitor</span></h1>
+        <p class="sub">the swarm, in real time — no tab-switching, no terminal</p>
+      </div>
+    </div>
+    <div class="head-right">
+      <span id="pill" class="pill pill-off"><span class="dot"></span><span id="pill-text">connecting…</span></span>
+      <button id="ctl-start" class="btn go" style="display:none" title="Start the swarm with your saved popup Topic">▶ Start swarm</button>
+      <button id="ctl-stop" class="btn stop" style="display:none" title="Stop after the current turn">■ Stop</button>
+      <button id="copy" class="btn" title="Copy ALL debug lines — paste straight into chat">📋 Copy debug</button>
+      <button id="clear" class="btn ghost" title="Clear the feed">✕</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="feed-wrap card">
+      <div class="feed-head">
+        <h2>Conversation</h2>
+        <label class="switch-row small">
+          <input id="show-debug" type="checkbox" />
+          <span>show debug stream</span>
+        </label>
+      </div>
+      <div id="feed" class="feed">
+        <div class="empty" id="empty">Waiting for the orchestrator…<br>
+          <small>Launch the swarm from the popup (🚀) or run <code>python orchestrator.py</code>. Replies appear here as they land.</small>
+        </div>
+      </div>
+    </section>
+
+    <aside class="side">
+      <section class="card">
+        <h2>Agents</h2>
+        <ul id="agents" class="agents"><li class="muted">none connected yet</li></ul>
+      </section>
+      <section class="card">
+        <h2>Run</h2>
+        <div class="kv"><span>turns captured</span><b id="stat-turns">0</b></div>
+        <div class="kv"><span>last hop</span><b id="stat-last">—</b></div>
+        <div class="kv"><span>started</span><b id="stat-started">—</b></div>
+        <div class="kv"><span>port</span><b id="stat-port">8765</b></div>
+      </section>
+      <section class="card">
+        <h2>Halt</h2>
+        <label class="switch-row">
+          <input id="halted" type="checkbox" />
+          <span>Freeze all agents <em>(kill switch)</em></span>
+        </label>
+      </section>
+    </aside>
+  </main>
+
+  <footer>
+    <span class="muted">tip: keep this tab open beside your chats — every reply, warning and error streams here automatically.</span>
+  </footer>
+
+  <script src="monitor.js"></script>
+</body>
+</html>

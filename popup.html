@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <img src="icons/icon48.png" alt="" width="28" height="28" />
+    <div>
+      <h1>Shoarma</h1>
+      <p class="sub">LLM Bridge control deck</p>
+    </div>
+    <span id="ver" class="ver"></span>
+  </header>
+
+  <!-- guided stepper: one clear next action at a time -->
+  <nav class="steps" aria-label="setup progress">
+    <span class="step" data-step="1"><i>1</i> Open tabs</span>
+    <span class="bar"></span>
+    <span class="step" data-step="2"><i>2</i> Launch</span>
+    <span class="bar"></span>
+    <span class="step" data-step="3"><i>3</i> Watch live</span>
+  </nav>
+
+  <section class="card launch">
+    <p id="coach" class="coach">👋 Step 1 — open logged-in tabs of chat.deepseek.com and chat.qwen.ai. I'll tell you when both agents are wired.</p>
+    <div class="progress"><div id="pbar" class="pbar" style="width:0%"></div></div>
+    <p id="ptext" class="ptext"></p>
+    <div class="row">
+      <button id="launch" class="big">🖥️ Start orchestrator</button>
+      <button id="start-run" class="big go" disabled>▶ Start swarm</button>
+      <button id="stop-run" class="ghost side stop" hidden>■ Stop</button>
+    </div>
+    <div class="row">
+      <button id="monitor" class="ghost side">📟 Open live monitor</button>
+    </div>
+    <p id="launch-hint" class="hint"></p>
+  </section>
+
+  <details class="card">
+    <summary>Settings <span class="tag">saved automatically</span></summary>
+
+    <label class="field">
+      <span>Topic / opening prompt</span>
+      <textarea id="topic" rows="3" placeholder="Leave empty for the built-in debate starter…"></textarea>
+    </label>
+
+    <div class="grid">
+      <label class="field">
+        <span>Turns</span>
+        <input id="turns" type="number" min="1" max="50" value="6" />
+      </label>
+      <label class="field">
+        <span>Timeout (s)</span>
+        <input id="timeout" type="number" min="30" max="600" value="180" />
+      </label>
+      <label class="field">
+        <span>Port</span>
+        <input id="port" type="number" min="1024" max="65535" value="8765" />
+      </label>
+    </div>
+
+    <label class="switch-row">
+      <input id="halted" type="checkbox" />
+      <span>Halt all agents <em>(kill switch — also Esc in any tab)</em></span>
+    </label>
+  </details>
+
+  <section class="card">
+    <div id="status" class="status"><span class="dot"></span> scanning tabs…</div>
+    <ul id="tabs"></ul>
+  </section>
+
+  <section class="card activity">
+    <div class="act-head">
+      <b>Activity</b>
+      <button id="copy-log" class="mini">📋 Copy all</button>
+      <button id="clear-log" class="mini ghost-mini">Clear</button>
+    </div>
+    <pre id="activity" class="activity"></pre>
+  </section>
+
+  <footer>
+    <a id="install-link" href="#">⬇ Download orchestrator.py</a>
+    <span>· read the <a href="https://github.com/Esrevorter/Shoarma/blob/main/README.md" target="_blank">README</a></span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

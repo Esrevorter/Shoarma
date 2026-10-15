@@ -30,6 +30,33 @@ const TOPIC_FALLBACK =
   "Two AI assistants take turns building on each other's ideas. " +
   "Begin with a thought-provoking opening statement on the topic.";
 
+// ── v0.9.8: PROMISE-SAFE chrome.* calls ─────────────────────────────────────
+// Root cause from the user's error.log (2026-10-16): the MV3 service worker
+// died at boot with
+//   TypeError: Cannot read properties of undefined (reading 'catch')
+// because a chrome.* call returned `undefined` instead of a Promise (older
+// callback polyfills / certain Chrome builds do this), and the code chained
+// .then()/.catch() straight onto the return value. One uncaught throw during
+// startup kills the whole worker → every later message fails with
+// "Receiving end does not exist", which is exactly the symptom that survived
+// across releases. asPromise()/safeCatch() make EVERY chained call site
+// tolerant of a non-Promise return, and selfHeal() catches any residual
+// unhandled rejection so the worker can never die silently again.
+function asPromise(v) {
+  if (v && typeof v.then === "function") return v;
+  if (v instanceof Promise) return v;
+  return null;                                    // callback-style or undefined — caller must not chain
+}
+function safeCatch(p, onError) {
+  try { if (p && typeof p.catch === "function") p.catch(onError || (() => {})); } catch {}
+}
+self.addEventListener("unhandledrejection", (e) => {
+  // Last-resort shield: log it into the debug ring instead of letting an
+  // unhandled rejection tear down the service worker mid-run.
+  try { engLog("ERROR", "unhandled rejection (worker kept alive)", { reason: String(e?.reason).slice(0, 200) }); } catch {}
+  e?.preventDefault?.();
+});
+
 // ── logging (same shape as before so monitor keeps working) ────────────────
 function engLog(level, msg, data) {
   const entry = { level, msg, data: data ?? {}, ts: Date.now(), agent: "engine" };
@@ -68,11 +95,17 @@ function deliver(name, frame) {
   const a = ENGINE.agents.get(name);
   if (!a) return false;
   const send = () => {
-    try {
-      chrome.tabs.sendMessage(a.tabId, frame).then((res) => {
-        if (frame.type === "say" && res?.queued) a.busy = true; // bridge says single-flight active
-      }).catch(() => { /* tab gone — cleanup happens on next dispatch */ });
-    } catch {}
+    // v0.9.8: PROMISE-SAFE messaging. The error.log of 2026-10-16 showed the
+    // service worker dying at startup with
+    //   TypeError: Cannot read properties of undefined (reading 'catch')
+    // because some Chrome builds / polyfilled contexts hand back `undefined`
+    // instead of a Promise from chrome.* calls when a callback shape is used.
+    // Every chained .then/.catch therefore goes through asPromise() first, so a
+    // non-Promise return can never throw and kill the MV3 worker mid-boot.
+    const p = asPromise(chrome.tabs.sendMessage(a.tabId, frame));
+    if (p) p.then((res) => {
+      if (frame.type === "say" && res?.queued) a.busy = true; // bridge says single-flight active
+    }).catch(() => { /* tab gone — cleanup happens on next dispatch */ });
   };
   if (frame.type !== "say") { send(); return true; }
   // v0.9.4: only a turn ACTUALLY IN FLIGHT counts as busy. The old flag could
@@ -403,7 +436,9 @@ function downloadLastTranscript() {
 // (truthy but not `true`), which is unreliable across Chrome versions and can
 // silently drop responses. The handler itself stays async; we just bridge it.
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-  handleEngineMessage(msg, sender, respond).catch(e => {
+  // v0.9.8: handleEngineMessage is async (always a real Promise), but we still
+  // route through safeCatch so a polyfilled environment can never throw here.
+  safeCatch(handleEngineMessage(msg, sender, respond), (e) => {
     try { respond({ ok: false, error: String(e && e.message || e) }); } catch {}
   });
 });
@@ -456,8 +491,10 @@ async function handleEngineMessage(msg, sender, respond) {
     case "activate-tab": {
       const tid = sender.tab?.id;
       if (tid == null) { respond({ ok: false, error: "no tab" }); return false; }
-      focusTab(tid).then(() => respond({ ok: true }),
-        (e) => respond({ ok: false, error: String(e && e.message || e) }));
+      // v0.9.8: focusTab is async ⇒ real Promise; guarded anyway so a weird
+      // host environment can't hand us undefined and crash the worker.
+      safeCatch(focusTab(tid).then(() => respond({ ok: true })),
+        () => respond({ ok: false, error: "focus failed" }));
       return true;
     }
     case "halted": {

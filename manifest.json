@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Shoarma",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "background": {
     "service_worker": "swarm-engine.js"
   },

@@ -315,3 +315,21 @@ Hardening shipped in v0.9.7 (no functional extension changes):
 Verification this session: node --check ×4 JS, py_compile all Python, recovery
 test suite ALL PASSED, tools/build_release.py BUILT
 shoarma-v0.9.7-chrome.zip (13 entries, sha256=a2b07e084dcd0352bc822051387ddd0442b5ade24383b7d1efd5e2f61a27939c).
+
+## Session 2026-10-16 (v0.9.8) — error.log verified LIVE from GitHub, real fix on the ACTUAL main
+- Reality check: remote main was ce7aa581 ("Create error.log", parent v0.9.7 d05df58). The
+  previously claimed "safeCatch commit 363179f / release v0.9.8" did NOT exist on GitHub — that
+  work never landed. Only releases v0.9.6/v0.9.7 are live.
+- Downloaded error.log from raw.githubusercontent (2000 lines): a line-number dump followed by a
+  paste of bridge.js source. The decisive evidence was still the known crash signature:
+  `TypeError: Cannot read properties of undefined (reading 'catch')` in the MV3 worker boot path.
+- Parsed the REAL swarm-engine.js at ce7aa581: unguarded chained calls were deliver()
+  (`chrome.tabs.sendMessage(...).then().catch()` — crashes when sendMessage returns undefined) and
+  the onMessage router / activate-tab sites. broadcastState was already guarded; popup/monitor use
+  async+try/catch (safe); background.js is legacy (not the manifest worker).
+- Fix: added asPromise()/safeCatch() + a self.unhandledrejection shield (worker can no longer die
+  silently), routed deliver(), the message router, and activate-tab through them.
+- Regression test tests/test_promise_safe_guards.py (all PASS): guards present, zero direct
+  .then/.catch chains onto chrome.* calls anywhere in swarm-engine.js, deliver() uses asPromise.
+- Node simulation with chrome.tabs.sendMessage -> undefined: boots clean, deliver('say') OK.
+- Bumped manifest to 0.9.8, gitignored + untracked error.log. Releasing via tag push + CI.

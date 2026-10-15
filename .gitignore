@@ -5,3 +5,4 @@ dist/
 errorlog
 run-*.log
 __pycache__/
+error.log

@@ -7,8 +7,20 @@
 
 const HOST = "com.shoarma.launcher";
 
+// v0.4: the live monitor page — a third tab where the whole swarm is visible
+// in real time (replies, agent states, debug stream), so users never have to
+// watch the terminal or alt-tab between chats.
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg?.type === "launch") { launch().then(respond); return true; }
+  if (msg?.type === "open-monitor") {
+    chrome.tabs.create({ url: chrome.runtime.getURL("monitor.html") });
+    respond({ ok: true }); return false;
+  }
+  if (msg?.type === "log") {                           // bridge debug → console
+    const e = msg.entry || {};
+    (e.level === "ERROR" ? console.warn : console.log)(`[Shoarma ${e.agent}] ${e.level}: ${e.msg}`, e.data ?? "");
+    respond({ ok: true }); return false;
+  }
   if (msg?.type === "agent-count") {                 // bridge pings us on connect
     bumpBadge(sender.tab?.id);
     respond({ ok: true });

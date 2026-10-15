@@ -1,10 +1,10 @@
 # orchestrator.py — router + turn governor for the LLM Bridge swarm.
-# v0.3: reads defaults from settings.json (written by scripts/sync-settings.py,
-#       which pulls them straight out of your Chrome profile), streams stdout
-#       line-by-line so the popup can show live progress, per-run transcripts.
+# v0.4: in-process HTTP side-server on the SAME port serves GET /state to the
+#       live monitor page (extension tab) — no terminal watching needed.
+#       Agent debug frames are recorded into the event feed + run log.
 # pip install websockets
 
-import argparse, asyncio, json, os, time
+import argparse, asyncio, json, logging, os, time
 from pathlib import Path
 
 AGENTS_EXPECTED = {"qwen", "deepseek"}
@@ -29,8 +29,59 @@ def load_settings() -> dict:
     return s
 
 
-def emit(line: str):
+def emit(line: str, hub=None):
     print(line, flush=True)   # flushed so `tee` / the launcher pipe stay live
+    if hub is not None:
+        hub.add({"type": "sys", "text": line})
+
+
+class Hub:
+    """Ring buffer of events + per-agent state, exposed to the monitor page."""
+    def __init__(self, max_events=500):
+        self.events: list[dict] = []
+        self.agents: dict[str, dict] = {}
+        self.seq = 0
+        self.max = max_events
+
+    def add(self, ev: dict) -> int:
+        self.seq += 1
+        ev = {"seq": self.seq, "ts": time.strftime("%H:%M:%S"), **ev}
+        self.events.append(ev)
+        if len(self.events) > self.max:
+            del self.events[: len(self.events) - self.max]
+        return self.seq
+
+    def agent(self, name: str, **kw):
+        self.agents.setdefault(name, {"state": "?", "turns": 0}).update(kw)
+
+    def snapshot(self) -> bytes:
+        return json.dumps({"agents": self.agents, "events": self.events,
+                           "seq": self.seq}).encode()
+
+
+async def http_side_server(hub: Hub, path: Path):
+    """Minimal HTTP/1.0 on a separate local port → GET /state (monitor poll)."""
+    async def handle(reader, writer):
+        try:
+            req = await asyncio.wait_for(reader.readline(), 5)
+            while True:                                   # drain headers
+                line = await asyncio.wait_for(reader.readline(), 5)
+                if line in (b"\r\n", b"\n", b""): break
+            body = hub.snapshot()
+            writer.write(
+                b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                b"Access-Control-Allow-Origin: *\r\nConnection: close\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        except Exception:
+            try: writer.write(b"HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n")
+            except Exception: pass
+        try:
+            await writer.drain(); writer.close()
+        except Exception: pass
+    srv = await asyncio.start_server(handle, HOST, 0)     # ephemeral OS port
+    port = srv.sockets[0].getsockname()[1]
+    (path.parent / "monitor-port.txt").write_text(str(port))
+    return srv, port
 
 
 def log_turn(entry: dict, transcript: list, path: Path):
@@ -39,7 +90,7 @@ def log_turn(entry: dict, transcript: list, path: Path):
     path.write_text(json.dumps(transcript, indent=2))
 
 
-async def handler(ws, agents: dict, pending: dict):
+async def handler(ws, agents: dict, pending: dict, hub: Hub):
     name = None
     try:
         async for raw in ws:
@@ -47,24 +98,36 @@ async def handler(ws, agents: dict, pending: dict):
             if msg["type"] == "register":
                 name = msg["agent"]
                 agents[name] = ws
-                emit(f"[+] node online: {name}")
+                hub.agent(name, state="ready")
+                emit(f"[+] node online: {name}", hub)
+            elif msg["type"] == "log":                     # agent debug frame
+                hub.add({"type": "log", "agent": msg.get("agent", name),
+                         "level": msg.get("level", "INFO"), "msg": str(msg.get("msg", ""))[:300],
+                         "data": msg.get("data"), "ts": time.strftime("%H:%M:%S")})
+                if msg.get("level") in ("INFO", "WARN", "ERROR"):
+                    emit(f"    [{name}] {msg.get('level')}: {str(msg.get('msg',''))[:120]}", hub)
+            elif msg["type"] == "state":                   # HUD → monitor mirror
+                hub.agent(name or msg.get("agent", "?"), state=msg.get("state"), turns=msg.get("turns", 0))
             elif msg["type"] in ("reply", "error"):
                 tag = "ERR " if msg["type"] == "error" else ""
+                hub.agent(name, state="idle", turns=hub.agents.get(name, {}).get("turns", 0) + 1)
                 fut = pending.pop(name, None)
                 if fut and not fut.done():
                     fut.set_result(f"{tag}{msg.get('text','')}")
     finally:
         if name:
             agents.pop(name, None)
+            hub.agent(name, state="offline")
             fut = pending.pop(name, None)
             if fut and not fut.done():
                 fut.set_exception(ConnectionError(f"{name} disconnected"))
-            emit(f"[-] node offline: {name}")
+            emit(f"[-] node offline: {name}", hub)
 
 
-async def ask(agents: dict, pending: dict, agent: str, text: str, timeout: int) -> str:
+async def ask(agents: dict, pending: dict, hub: Hub, agent: str, text: str, timeout: int) -> str:
     fut = asyncio.get_running_loop().create_future()
     pending[agent] = fut
+    hub.agent(agent, state="writing")
     await agents[agent].send(json.dumps({"type": "say", "text": text}))
     return await asyncio.wait_for(fut, timeout)
 
@@ -83,19 +146,37 @@ async def main():
     agents: dict[str, object] = {}
     pending: dict[str, asyncio.Future] = {}
     transcript: list[dict] = []
+    hub = Hub()
 
     run_dir = Path(os.environ.get("SHOARMA_HOME", "."))
     run_dir.mkdir(parents=True, exist_ok=True)
     tstamp = time.strftime("%Y%m%d-%H%M%S")
     out_path = run_dir / f"transcript-{tstamp}.json"
     log_path = run_dir / f"run-{tstamp}.log"
+    debug_path = run_dir / f"debug-{tstamp}.log"
 
+    ws_log_handler = logging.FileHandler(debug_path, encoding="utf-8")
+    ws_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger("websockets").addHandler(ws_log_handler)
+
+    side_srv, http_port = await http_side_server(hub, log_path)
+    try:                                   # also publish the WS port so the
+        (run_dir / "ws-port.txt").write_text(str(args.port))  # extension can find us on custom ports
+    except Exception:
+        pass
+    try:                                   # fallback location the monitor probes
+        Path("/tmp/shoarma").mkdir(exist_ok=True)
+        Path("/tmp/shoarma/monitor-port.txt").write_text(str(http_port))
+        Path("/tmp/shoarma/ws-port.txt").write_text(str(args.port))
+    except OSError:
+        pass
     async with __import__("websockets").serve(
-            lambda ws: handler(ws, agents, pending), HOST, args.port):
-        emit(f"ws://{HOST}:{args.port} — open both tabs, waiting for {sorted(AGENTS_EXPECTED)}")
+            lambda ws: handler(ws, agents, pending, hub), HOST, args.port):
+        emit(f"ws://{HOST}:{args.port} — open both tabs, waiting for {sorted(AGENTS_EXPECTED)}", hub)
+        emit(f"📟 live monitor feed: http://127.0.0.1:{http_port}/state  (open the Shoarma Monitor tab)", hub)
         while not AGENTS_EXPECTED.issubset(agents):
             await asyncio.sleep(0.3)          # snappier readiness detection
-        emit("both agents online. starting.\n")
+        emit("both agents online. starting.\n", hub)
 
         msg = opening
         aborted = False
@@ -106,27 +187,38 @@ async def main():
                 # instant the previous reply lands (no polling gaps).
                 a, b = order if turn % 2 else order[::-1]
                 t0 = time.monotonic()
-                ra = await ask(agents, pending, a, msg, args.timeout)
+                ra = await ask(agents, pending, hub, a, msg, args.timeout)
                 mid = time.monotonic() - t0
                 log_turn({"turn": turn, "agent": a, "seconds": round(mid, 1), "text": ra},
                          transcript, out_path)
-                emit(f"<<< {a}: {ra[:400]}")
-                rb = await ask(agents, pending, b, ra, args.timeout)
+                hub.add({"type": "reply", "agent": a, "turn": turn,
+                         "seconds": round(mid, 1), "text": ra})
+                emit(f"<<< {a}: {ra[:400]}", hub)
+                rb = await ask(agents, pending, hub, b, ra, args.timeout)
                 tot = time.monotonic() - t0
                 log_turn({"turn": turn, "agent": b, "seconds": round(tot - mid, 1), "text": rb},
                          transcript, out_path)
-                emit(f"<<< {b}: {rb[:400]}")
-                emit(f"--- turn {turn} done in {tot:.1f}s ---\n")
+                hub.add({"type": "reply", "agent": b, "turn": turn,
+                         "seconds": round(tot - mid, 1), "text": rb})
+                emit(f"<<< {b}: {rb[:400]}", hub)
+                emit(f"--- turn {turn} done in {tot:.1f}s ---\n", hub)
                 msg = rb                      # last speaker's reply chains onward
             except (asyncio.TimeoutError, ConnectionError) as e:
-                emit(f"!! aborting after partial transcript ({len(transcript)} turns): {e!r}")
+                emit(f"!! aborting after partial transcript ({len(transcript)} turns): {e!r}", hub)
                 aborted = True
                 break
 
         if not aborted:
-            emit(f"\nsaved {len(transcript)} turns → {out_path}")
+            emit(f"\nsaved {len(transcript)} turns → {out_path}", hub)
         log_path.write_text("\n".join(t["text"] for t in transcript) or "(empty)")
-        await asyncio.sleep(1)   # let the final frame flush before the server dies
+        debug_path.write_text("\n".join(
+            f"{e['ts']} {e.get('level','SYS').upper():5} [{e.get('agent','orch')}] "
+            f"{e.get('msg') or e.get('text','')}"
+            + (f" :: {json.dumps(e['data'])[:300]}" if e.get("data") else "")
+            for e in hub.events if e["type"] in ("log", "sys")))
+        emit(f"(live feed stays up at http://127.0.0.1:{http_port}/state for 60s…)", hub)
+        await asyncio.sleep(60)   # keep monitor readable briefly after the run
+        side_srv.close()
 
 
 if __name__ == "__main__":

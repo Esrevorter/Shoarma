@@ -1,9 +1,24 @@
 // bridge.js — one instance per LLM tab. Each instance = one agent node.
-// v0.3: settings come from the popup (chrome.storage.sync, live updates),
-//       HUD injected via manifest css, status reported to the control deck.
+// v0.4: debug ring buffer + copyable diagnostics, live feed to monitor page,
+//       stricter assistant-bubble matching, mid-stream liveness check.
 
 let WS_URL = "ws://127.0.0.1:8765";   // re-derived from the saved port below
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ── DEBUG LOG ────────────────────────────────────────────────────────────────
+// Every action is timestamped into a 300-entry ring buffer. Copy it with one
+// click (HUD 📋 button) or from the console: __lbLog(). Sent to the orchestrator
+// on every reply/error frame so run-*.log files contain the real story.
+const LB_LOG = [];
+function lbLog(level, msg, data) {
+  const e = { ts: new Date().toISOString().slice(11, -5), agent: CFG?.name || "?", level, msg,
+              ...(data !== undefined ? { data: (() => { try { return JSON.parse(JSON.stringify(data)); } catch { return String(data).slice(0, 200); } })() } : {}) };
+  LB_LOG.push(e); if (LB_LOG.length > 300) LB_LOG.shift();
+  (level === "ERROR" ? console.warn : console.log)(`[Shoarma ${e.agent}] ${level}: ${msg}`, data ?? "");
+  try { chrome.runtime.sendMessage({ type: "log", entry: e }); } catch {}
+  try { state.ws?.readyState === 1 && state.ws.send(JSON.stringify({ type: "log", agent: e.agent, level, msg, data: e.data })); } catch {}
+}
+globalThis.__lbLog = () => LB_LOG.map(e => `${e.ts} ${e.level.padEnd(5)} ${e.msg}${e.data !== undefined ? " :: " + JSON.stringify(e.data).slice(0, 300) : ""}`).join("\n");
 
 // ── PER-SITE SELECTORS. You WILL need to inspect the DOM and fix these. ──
 const SITES = {
@@ -30,6 +45,18 @@ if (!CFG) {
   console.warn("LLM Bridge: no site config for", location.hostname);
 } else {
   const state = { halted: false, ws: null, turns: 0, lastMs: 0, lastState: "connecting" };
+
+  // ── Monitor feed (v0.4): the orchestrator mirrors everything into a Hub that
+  //    the third-page live monitor polls. We push HUD state changes upstream so
+  //    the monitor shows exactly what every tab's pill shows. ─────────────────
+  function feedMonitor(label) {
+    try {
+      state.ws?.readyState === 1 && state.ws.send(JSON.stringify({
+        type: "state", agent: CFG.name, state: label.toLowerCase().replace(/…/g, "").trim(),
+        turns: state.turns,
+      }));
+    } catch {}
+  }
 
   // ── Settings from the popup UI (chrome.storage.sync). Live: change a value
   //    in the control deck and this tab reacts without a reload. ─────────────
@@ -58,16 +85,37 @@ if (!CFG) {
     el.dispatchEvent(new Event("input", { bubbles: true }));
   }
 
+  // ── Bubble matching. The old selectors also hit USER bubbles (generic
+  // .markdown-body exists in both) → we sometimes read back our own prompt
+  // ("decoding errors"), and when neither matched → "(no response captured)".
+  // Now: candidate nodes are filtered by ancestor role/class, never user-owned.
+  const BUBBLE_CANDIDATES = '[data-role="assistant"], [data-message-author-role="assistant"], [class*="assistant"] [class*="content"], [class*="reply-content"], [class*="markdown"]';
+  const USER_HINT = /user|human|question|query|prompt/i;
+  function isAssistantBubble(el) {
+    for (let n = el, d = 0; n && d < 8; n = n.parentElement, d++) {
+      const id = `${n.className} ${n.id} ${n.getAttribute?.("data-role") ?? ""} ${n.getAttribute?.("data-message-author-role") ?? ""}`;
+      if (/assistant|answer|model|bot|response|reply/i.test(id)) return true;
+      if (USER_HINT.test(id)) return false;
+    }
+    return false;
+  }
+  function assistantNodes() {
+    return [...document.querySelectorAll(BUBBLE_CANDIDATES)].filter(isAssistantBubble);
+  }
+
   async function say(text) {
+    lbLog("INFO", "say: typing into input", { chars: text.length, preview: text.slice(0, 60) });
     const el = document.querySelector(CFG.input);
-    if (!el) throw new Error("LLM Bridge: input not found");
+    if (!el) { lbLog("ERROR", "input NOT FOUND", { selector: CFG.input, hint: "site DOM changed — update SITES.input" }); throw new Error("LLM Bridge: input not found"); }
     el.focus();
     setNativeValue(el, text);
     await sleep(90 + Math.random() * 140);           // human-ish but snappy
     const btn = document.querySelector(CFG.send);
     if (btn && !btn.disabled) {
+      lbLog("DEBUG", "clicking send button", { sel: CFG.send });
       btn.click();
     } else {
+      lbLog("DEBUG", "send button absent/disabled → Enter key fallback", { btn: !!btn, disabled: btn?.disabled });
       el.dispatchEvent(new KeyboardEvent("keydown",
         { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
     }
@@ -80,38 +128,60 @@ if (!CFG) {
     const t0 = Date.now();
     let delay = 60;                                   // quick initial poll…
     while (Date.now() - t0 < maxMs) {
-      if (document.querySelector(CFG.stop)) return true;
+      if (document.querySelector(CFG.stop)) { lbLog("DEBUG", "generation started (stop button visible)", { ms: Date.now() - t0 }); return true; }
       await sleep(delay);
       delay = Math.min(delay * 1.5, 300);             // …then backs off gently
     }
+    lbLog("WARN", "no stop button seen within " + maxMs + "ms — proceeding anyway",
+          { stopSel: CFG.stop, matches: document.querySelectorAll(CFG.stop).length });
     return false; // some UIs have no stop button — proceed anyway
   }
 
   // Wait for generation to FINISH: debounce on DOM mutations, scoped to the
   // chat container when possible (body-wide observers fire on every unrelated
   // re-render). quietMs is the settle window after the last token appears.
+  // If the stop button vanishes (generation ended) we cut the quiet window in
+  // half — faster capture without risking a mid-stream read.
   function waitForIdle({ quietMs = 1000, timeoutMs = 120000 } = {}) {
     return new Promise((resolve) => {
-      const target = document.querySelector(CFG.bubbles)?.closest(
+      const target = document.querySelector(BUBBLE_CANDIDATES)?.closest(
                        "[class*='chat'], main") || document.body;
       let quiet;
+      const effQuiet = () => (document.querySelector(CFG.stop) ? quietMs : quietMs / 2);
       const obs = new MutationObserver(() => {
         clearTimeout(quiet);
-        quiet = setTimeout(() => done(false), quietMs);
+        quiet = setTimeout(() => done(false), effQuiet());
       });
       obs.observe(target, { subtree: true, childList: true, characterData: true });
-      quiet = setTimeout(() => done(false), quietMs);
+      quiet = setTimeout(() => done(false), effQuiet());
       const hard = setTimeout(() => done(true), timeoutMs);
-      function done(timedOut) { clearTimeout(quiet); clearTimeout(hard); obs.disconnect(); resolve(timedOut); }
+      function done(timedOut) { clearTimeout(quiet); clearTimeout(hard); obs.disconnect();
+        lbLog(timedOut ? "WARN" : "DEBUG", timedOut ? "idle wait TIMED OUT (still generating?)" : "stream settled", { ms: Date.now() - start }); resolve(timedOut); }
+      const start = Date.now();
     });
   }
 
   function lastAssistantText() {
-    const nodes = [...document.querySelectorAll(CFG.bubbles)];
+    const nodes = assistantNodes();
+    lbLog("DEBUG", "scanning assistant bubbles", { candidates: nodes.length });
     for (let i = nodes.length - 1; i >= 0; i--) {
       const t = (nodes[i].innerText || "").trim();
-      if (t) return t;
+      if (t) {
+        if (t.startsWith("(no response")) { lbLog("WARN", "captured placeholder-looking bubble", { len: t.length }); continue; }
+        lbLog("INFO", "captured reply", { chars: t.length, preview: t.slice(0, 80) });
+        return t;
+      }
     }
+    // Full diagnostic instead of a bare "(no response captured)":
+    lbLog("ERROR", "NO RESPONSE CAPTURED", {
+      bubbleSel: BUBBLE_CANDIDATES,
+      totalMatches: document.querySelectorAll(BUBBLE_CANDIDATES).length,
+      passedAssistantFilter: nodes.length,
+      sampleClasses: [...document.querySelectorAll(BUBBLE_CANDIDATES)].slice(-4)
+        .map(n => (n.parentElement?.className || "?").toString().slice(0, 70)),
+      bodyLen: document.body.innerText.length,
+      url: location.href.split("?")[0],
+    });
     return "(no response captured)";
   }
 
@@ -129,6 +199,7 @@ if (!CFG) {
       <span class="lb-state">connecting…</span>
       <span class="lb-stats"></span>
       <button class="lb-btn lb-danger" title="Halt / resume (Esc)">HALT</button>
+      <button class="lb-btn" id="lb-copy" title="Copy debug log to clipboard">📋</button>
       <button class="lb-btn" title="Collapse">—</button>`;
     // inline fallback in case the page's CSP blocks the content-script stylesheet
     box.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;" +
@@ -138,6 +209,15 @@ if (!CFG) {
     document.body.appendChild(box);
     box.querySelector(".lb-danger").onclick = () => toggleHalt();
     box.querySelectorAll(".lb-btn")[1].onclick = () => box.classList.toggle("lb-min");
+    box.querySelector("#lb-copy").onclick = async (ev) => {
+      const btn = ev.currentTarget;
+      try { await navigator.clipboard.writeText(globalThis.__lbLog()); }
+      catch { /* page CSP may block it — fall back */ 
+        const ta = document.createElement("textarea"); ta.value = globalThis.__lbLog();
+        document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+      btn.textContent = "✓"; setTimeout(() => (btn.textContent = "📋"), 1500);
+      lbLog("INFO", "debug log copied to clipboard", { lines: LB_LOG.length });
+    };
     return box;
   })();
 
@@ -162,6 +242,7 @@ if (!CFG) {
     hudEl.querySelector(".lb-state").textContent = label;
     hudEl.querySelector(".lb-stats").textContent =
       state.turns ? `${state.turns}x · ${(state.lastMs/1000).toFixed(1)}s` : "";
+    feedMonitor(label);
   }
 
   // ── Connection ─────────────────────────────────────────────────────────────
@@ -173,16 +254,18 @@ if (!CFG) {
 
     ws.onopen = () => {
       backoff = 1000;                                 // reset on success
+      lbLog("INFO", "websocket connected → registering as " + CFG.name, { url: WS_URL });
       ws.send(JSON.stringify({ type: "register", agent: CFG.name }));
       hud("ready");
       try { chrome.runtime.sendMessage({ type: "agent-count" }); } catch {}
     };
 
     ws.onmessage = async (ev) => {
-      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type !== "say" || state.halted) return;
+      let msg; try { msg = JSON.parse(ev.data); } catch (e) { lbLog("ERROR", "bad frame from orchestrator (JSON parse)", { raw: String(ev.data).slice(0, 200), err: String(e) }); return; }
+      if (msg.type !== "say" || state.halted) { if (state.halted && msg.type === "say") lbLog("WARN", "dropping incoming say while HALTED", { preview: String(msg.text).slice(0, 60) }); return; }
 
       const t0 = performance.now();
+      lbLog("INFO", `turn #${state.turns + 1}: received prompt`, { chars: String(msg.text).length, preview: String(msg.text).slice(0, 80) });
       try {
         hud("writing…");
         await say(msg.text);
@@ -192,16 +275,19 @@ if (!CFG) {
         const text = lastAssistantText();
         state.turns++;
         state.lastMs = performance.now() - t0;
+        lbLog("INFO", `turn #${state.turns} complete`, { seconds: +(state.lastMs / 1000).toFixed(1), replyChars: text.length });
         hud("idle");
         ws.send(JSON.stringify({ type: "reply", agent: CFG.name, text }));
       } catch (e) {
+        lbLog("ERROR", "turn FAILED", { error: String(e), stack: String(e.stack).split("\n").slice(0, 3).join(" | ") });
         hud("error");
         ws.send(JSON.stringify({ type: "error", agent: CFG.name, text: String(e) }));
       }
     };
 
-    ws.onclose = () => { hud("connecting…"); setTimeout(connect, backoff);
-                         backoff = Math.min(backoff * 2, 15000); };
+    ws.onclose = (ev) => { lbLog("WARN", `websocket closed (code ${ev.code}) — retrying in ${Math.round(backoff / 1000)}s`, { url: WS_URL });
+                           hud("connecting…"); setTimeout(connect, backoff);
+                           backoff = Math.min(backoff * 2, 15000); };
     ws.onerror = () => ws.close();
   }
 

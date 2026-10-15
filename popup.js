@@ -45,6 +45,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       const res = await chrome.runtime.sendMessage({ type: "launch" });
       if (res?.ok) {
         setHint(`Orchestrator running (pid ${res.pid}). Transcript → Downloads/shoarma/`, "ok");
+        chrome.runtime.sendMessage({ type: "open-monitor" });   // v0.4: live view opens itself
       } else {
         setHint(res?.error || "Launch failed — see hint above.", "err");
       }
@@ -55,6 +56,9 @@ document.addEventListener("DOMContentLoaded", async () => {
       $("launch").textContent = "🚀 Launch swarm";
     }
   };
+
+  // ── v0.4: open the live monitor any time (works even without native host) ──
+  $("monitor").onclick = () => chrome.runtime.sendMessage({ type: "open-monitor" });
 
   // ── live tab roster: ask every bridge instance how it feels ────────────
   const tabsEl = $("tabs"), statusEl = $("status");

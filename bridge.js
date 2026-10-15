@@ -86,6 +86,7 @@ if (!CFG) {
   // internal state never updates and Send stays disabled. You must call the
   // native prototype setter and dispatch a bubbling 'input' event.
   function setNativeValue(el, value) {
+    if (isCE(el)) { setCEValue(el, value); return; }
     // v0.7: clear first, then write — some sites (qwen) keep internal
     // composition state that makes a single set look like "text present but
     // nothing typed" to their React handlers.
@@ -98,6 +99,64 @@ if (!CFG) {
     desc(proto).set.call(el, value);
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));   // belt & braces
+  }
+
+  // ── v0.8.2: contenteditable support. Qwen's editor is sometimes a plain
+  // <textarea> and sometimes a CE div ("ime-text-area") whose React handler
+  // IGNORES synthetic events on the host and reads its model from the hidden
+  // IME proxy textarea instead. That's why 9k-char messages sat in the box
+  // forever: text was visible, state was empty, Send stayed disabled.
+  // The reliable path for CE editors is an *executed* beforeinput event with
+  // inputType "insertFromDrop"/"insertText" — execCommand routes through the
+  // browser's own editing pipeline so the framework sees real mutations.
+  const isCE = (el) => !!el && (el.getAttribute?.("contenteditable") === "true" ||
+                                 el.getAttribute?.("contenteditable") === "plaintext-only");
+  function setCEValue(el, value) {
+    try { document.execCommand("selectAll"); } catch {}
+    let ok = false;
+    try {
+      const evt = new InputEvent("beforeinput", {
+        bubbles: true, cancelable: true, composed: true,
+        inputType: "insertFromDrop", data: value,
+      });
+      ok = el.dispatchEvent(evt) === false;           // false ⇒ app called preventDefault ⇒ handled
+    } catch {}
+    if (!ok) {
+      try { ok = document.execCommand("insertText", false, value); } catch { ok = false; }
+    }
+    if (!ok || !readBox(el).trim()) {                 // last resort: direct DOM write
+      el.textContent = value;
+    }
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: value }));
+  }
+  function ceInsertAtCaret(el, chunk) {
+    // v0.8.2: retype fallback used to rewrite the WHOLE buffer per character —
+    // O(n²), ~140s for a 9k message, and it interleaved every char with the
+    // site's own caret writes (the scrambled boxes in the user log). Now we
+    // insert small chunks at the caret via one executed beforeinput each.
+    try {
+      const sel = window.getSelection();
+      const range = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+      const inside = range && (el.contains(range.startContainer) || range.startContainer === el);
+      if (!inside) {                                   // place caret at end of editor
+        const r = document.createRange();
+        r.selectNodeContents(el); r.collapse(false);
+        sel.removeAllRanges(); sel.addRange(r);
+      }
+    } catch {}
+    let ok = false;
+    try {
+      const evt = new InputEvent("beforeinput", {
+        bubbles: true, cancelable: true, composed: true,
+        inputType: "insertText", data: chunk,
+      });
+      ok = el.dispatchEvent(evt) === false;
+    } catch {}
+    if (!ok) { try { ok = document.execCommand("insertText", false, chunk); } catch { ok = false; } }
+    if (!ok) {                                         // manual append fallback
+      try { el.appendChild(document.createTextNode(chunk)); } catch {}
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: chunk }));
+    }
   }
 
   // v0.7: synthetic key events Chrome would normally refuse to forge from a
@@ -169,6 +228,8 @@ if (!CFG) {
     doc = doc || document;
     const sel = CFG.input || "textarea";
     try {
+      // v0.8.2: the site's OWN input selector wins (a real <textarea> is never
+      // mistaken for the hidden IME proxy textarea CE editors keep around).
       for (const s of [sel, 'textarea:not([type="hidden"])', '[contenteditable="true"]', '[contenteditable="plaintext-only"]']) {
         if (!s) continue;
         for (const el of doc.querySelectorAll(s)) {
@@ -180,6 +241,26 @@ if (!CFG) {
       }
     } catch {}
     return null;
+  }
+
+  // ── v0.8.2: React state probe. The single most useful diagnostic we ever
+  // lacked: a box can LOOK full (readBox returns text) while React's internal
+  // value is "" — which is exactly why send clicks silently did nothing and
+  // turns captured STALE replies. Reading the element's __reactFiber/__reactProps
+  // chain tells us whether our injection actually landed in the app's model.
+  function reactValueOf(el) {
+    try {
+      for (const k of Object.keys(el)) {
+        if (!k.startsWith("__reactFiber$") && !k.startsWith("__reactProps$")) continue;
+        let node = el[k], hops = 0;
+        while (node && hops++ < 30) {
+          const p = node.memoizedProps || node.pendingProps;
+          if (p && typeof p.value === "string") return p.value;
+          node = node.return;
+        }
+      }
+    } catch {}
+    return null;                                       // no fiber found — unknown
   }
 
   function readBox(el) {
@@ -276,6 +357,18 @@ if (!CFG) {
         lbLog("WARN", `injection attempt ${attempt}: box still empty after setNativeValue`, { tag: el.tagName, cls: String(el.className).slice(0, 80) });
         continue;
       }
+      // v0.8.2: React-state verification. If the fiber's controlled value is
+      // "" while the DOM looks full, NO send channel can work — the app
+      // literally believes the box is empty. Log it loudly and skip straight
+      // to the retype fallback instead of burning 3 × 6 seconds on dead clicks.
+      const rv = reactValueOf(el);
+      if (rv !== null && !rv.trim() && text.trim()) {
+        lbLog("WARN", `injection attempt ${attempt}: DOM full but React state EMPTY — synthetic events ignored by editor`,
+              { tag: el.tagName, ce: isCE(el), domChars: readBox(el).length });
+        if (attempt < 3) continue;
+      } else if (rv !== null) {
+        lbLog("DEBUG", `react state ok (${rv.length} chars)`, { attempt });
+      }
 
       // Try every send channel, verifying after each that the box EMPTIED
       // (emptied box == the site consumed the message).
@@ -300,24 +393,34 @@ if (!CFG) {
       if (!submitted && attempt < 3) lbLog("WARN", `message still sitting in box after attempt ${attempt} — re-injecting`);
     }
 
-    // v0.7.1→v0.8: last resort for stubborn contenteditable inputs (qwen uses
-    // one in some builds). Retype ONE CHARACTER AT A TIME with real input +
-    // keydown events per char, then Enter + button click. This mimics human
-    // typing closely enough that editor keydown handlers fire reliably.
+    // v0.7.1→v0.8→v0.8.2: last resort for stubborn editors. The old retype
+    // rewrote the ENTIRE buffer per character (O(n²), ~140s for a 9k message)
+    // and its synthetic events fed the site's caret handler too — producing
+    // interleaved garbage like "H:e\nrOeb'jse...". New approach: clear once,
+    // then insert SMALL CHUNKS at the caret via executed beforeinput /
+    // execCommand so React commits state between chunks. ~30× faster and the
+    // text lands in order.
     if (!submitted && readBox(el).trim()) {
-      lbLog("WARN", "button/submit/Enter all failed — per-character retype (real keystroke simulation)", { remaining: readBox(el).trim().slice(0, 40) });
+      lbLog("WARN", "button/submit/Enter all failed — chunked caret retype", { remaining: readBox(el).trim().slice(0, 40) });
       await activateSelf("retype");                   // needs real focus most of all
       try {
-        setNativeValue(el, "");
-        for (const ch of text) {
+        setNativeValue(el, "");                       // ONE clean clear
+        el.focus({ preventScroll: true });
+        const CH = isCE(el) ? 64 : 120;               // CE handlers commit slower
+        for (let i = 0; i < text.length; i += CH) {
           el.focus({ preventScroll: true });
-          const before = readBox(el);
-          setNativeValue(el, before + ch);
-          el.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: ch }));
-          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: ch }));
-          await sleep(10 + Math.random() * 14);
+          const chunk = text.slice(i, i + CH);
+          if (isCE(el)) ceInsertAtCaret(el, chunk);
+          else {
+            const before = readBox(el);
+            const d = Object.getOwnPropertyDescriptor(
+              el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, "value");
+            d.set.call(el, before + chunk);
+            el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: chunk }));
+          }
+          await sleep(isCE(el) ? 30 : 15);
         }
-        await sleep(200);
+        await sleep(250);
         pressEnter(el);
         if (!(await waitBoxEmptied(el, 1500))) {
           const b2 = findSendButton();
@@ -328,9 +431,9 @@ if (!CFG) {
     }
     if (!submitted) {
       lbLog("ERROR", "MESSAGE NOT SUBMITTED — text still sits in the input box after every channel", { preview: readBox(el).trim().slice(0, 60), hidden: document.hidden });
-    } else {
-      lbLog("DEBUG", "message submitted (input box emptied)");
+      throw new Error("LLM Bridge: message not submitted");   // v0.8.2: FAIL LOUDLY
     }
+    lbLog("DEBUG", "message submitted (input box emptied)");
   }
 
   // Poll until the input box empties (= the site consumed the message) or timeout.
@@ -390,10 +493,21 @@ if (!CFG) {
     const t0 = Date.now();
     if (baseline < 0) baseline = assistantNodes().length;
     let delay = 60;                                   // quick initial poll…
+    // v0.8.2: the STOP-BUTTON signal alone is NOT proof of a new turn — qwen
+    // keeps one in the DOM between chats, so we "confirmed" starts that never
+    // happened and then captured the PREVIOUS reply (turns #4/#10/#11 in the
+    // user log returned byte-identical text seconds after a failed send).
+    // New rule: require either a genuinely NEW bubble, or an existing last
+    // bubble whose TEXT GREW after we saw the stop button.
+    let sawStop = false;
+    const lastLen = () => { const n = assistantNodes(); return n.length ? norm(n[n.length - 1].innerText ?? "").length : 0; };
+    const baseLen = lastLen();
     while (Date.now() - t0 < maxMs) {
-      if (document.querySelector(CFG.stop)) { lbLog("DEBUG", "generation started (stop button visible)", { ms: Date.now() - t0 }); return true; }
+      const nowStop = !!document.querySelector(CFG.stop);
+      if (nowStop) sawStop = true;
       const n = assistantNodes().length;
       if (n > baseline) { lbLog("DEBUG", "generation started (new assistant bubble appeared)", { ms: Date.now() - t0, bubbles: n }); return true; }
+      if (sawStop && lastLen() > baseLen + 20) { lbLog("DEBUG", "generation started (stop button + last bubble growing)", { ms: Date.now() - t0 }); return true; }
       await sleep(delay);
       delay = Math.min(delay * 1.5, 300);             // …then backs off gently
     }
@@ -454,9 +568,16 @@ if (!CFG) {
     return text;
   }
 
+  const norm = (s) => String(s).replace(/\s+/g, " ").trim().toLowerCase();
+
   function looksLikeChrome(t) {
     // short UI-vocabulary strings ("I prefer this response", "Copy", 👍 labels)
     if (CHROME_EXACT.test(t.trim())) return true;     // v0.8: "Thinking completed" etc.
+    // v0.8.2: qwen's error toast ("Oops! There was an issue connecting to…")
+    // and bare reasoning headers were relayed as full replies (user log
+    // 14:57/15:05). Treat them as chrome so the orchestrator retries the hop.
+    if (/^oops!?\b/i.test(t.trim()) || /was an issue connecting|service is currently exhausted|rate.?limit/i.test(t)) return true;
+    if (/^(thinking|deep thinking|analyzing)\b.{0,30}$/i.test(t.trim())) return true;
     return t.length < 60 && CHROME_HINT.test(t) && !/[.!?…]"']$/.test(t);
   }
   // v0.6 CONFIRM STEP — qwen's "which response do you prefer?" gate leaves a
@@ -501,7 +622,6 @@ if (!CFG) {
       if (t.startsWith("(no response")) { lbLog("WARN", "captured placeholder-looking bubble", { len: t.length }); continue; }
       // ECHO GUARD: never accept our own prompt back as a reply — this was the
       // single biggest desync source (the debate then loops on stale text).
-      const norm = (s) => s.replace(/\s+/g, " ").trim().toLowerCase();
       if (lastSentText && norm(t) === norm(lastSentText)) { lbLog("WARN", "skipped echoed prompt bubble", { chars: t.length }); continue; }
       if (looksLikeChrome(t)) { lbLog("WARN", "skipped UI-chrome string", { preview: t.slice(0, 40) }); continue; }
       lbLog("INFO", "captured reply", { chars: t.length, preview: t.slice(0, 80) });

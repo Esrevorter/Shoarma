@@ -308,6 +308,8 @@ async def handler(ws, agents: dict, pending: dict, hub: Hub, control: dict):
             elif msg["type"] in ("reply", "error"):
                 tag = "ERR " if msg["type"] == "error" else ""
                 hub.agent(name, state="idle", turns=hub.agents.get(name, {}).get("turns", 0) + 1)
+                if msg["type"] == "error":
+                    emit(f"[{name}] bridge reported failure: {str(msg.get('text',''))[:120]}", hub)
                 fut = pending.pop(name, None)
                 if fut and not fut.done():
                     fut.set_result(f"{tag}{msg.get('text','')}")
@@ -370,14 +372,24 @@ RETRY_NOTE = ("(Your previous message did not reach me — the bridge lost my "
 CAPTURE_JUNK = ("(no response captured)", "ERR ", "[Shoarma", "undefined",
                 "Thinking completed")
 
+# v0.8.2: the site's own error toast ("Oops! There was an issue connecting to
+# Qwen3.7-Plus... service is currently exhausted") came back as a legitimate
+# 127-char reply three times in the user log (14:57/15:05/15:06) and got
+# relayed to the partner debater verbatim. It is NOT an argument — retry it.
+import re as _re
+JUNK_PAT = _re.compile(
+    r"^oops!?\b|was an issue connecting|service is currently exhausted"
+    r"|rate.?limit", _re.I)
+
 
 def looks_junk(t):
     tl = t.lower()
     return (t.startswith("ERR") or len(t.strip()) < 3
+            or bool(JUNK_PAT.search(t))
             or any(j.lower() in tl for j in CAPTURE_JUNK))
 
 
-async def ask_robust(agents, pending, hub, agent, text, timeout, retries=1, control=None):
+async def ask_robust(agents, pending, hub, agent, text, timeout, retries=2, control=None):
     """ask() + capture validation. Returns (text, ok).
     v0.8.1: per-hop fault isolation — a timeout or a disconnected tab no longer
     aborts the whole run; we substitute RETRY_NOTE and give the next hop a

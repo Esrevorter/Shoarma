@@ -48,8 +48,12 @@ globalThis.__lbLog = () => LB_LOG.map(e => `${e.ts} ${e.level.padEnd(5)} ${e.msg
 const SITES = {
   "chat.deepseek.com": {
     name: "deepseek",
-    input:      'textarea',
-    send:       'button[type="submit"], button[aria-label*="Send" i]',
+    // v0.9.2: DeepSeek's composer is a <textarea id="chat-input"> wrapped in a
+    // form; the bare 'textarea' selector also matches hidden IME/search proxies,
+    // which produced the user log 19:12 symptom (text injected into an offscreen
+    // box → never submitted). Prefer stable ids/testids, then fall back.
+    input:      '#chat-input, textarea[placeholder], textarea[name*="chat" i], textarea',
+    send:       'form button[type="submit"], button[aria-label*="Send" i], button[aria-label*="发送"]',
     // ⚠️ Scope to ASSISTANT bubbles only, or you'll read your own prompt back.
     bubbles:    '[data-role="assistant"], .markdown-body, [class*="assistant"] [class*="content"]',
     stop:       'button[aria-label*="Stop" i]',
@@ -255,11 +259,23 @@ if (!CFG) {
     try {
       // v0.8.2: the site's OWN input selector wins (a real <textarea> is never
       // mistaken for the hidden IME proxy textarea CE editors keep around).
+      // v0.9.2: within each selector tier, prefer the LARGEST visible element —
+      // chat composers are big; hidden/IME/search proxy textareas are tiny or
+      // zero-size. Fixes DeepSeek picking the wrong box (log 19:12:41).
+      const pickBest = (els) => {
+        let best = null, bestArea = -1;
+        for (const el of els) {
+          if (!isVisible(el)) continue;
+          const r = el.getBoundingClientRect();
+          const area = r.width * r.height;
+          if (area > bestArea) { best = el; bestArea = area; }
+        }
+        return best;
+      };
       for (const s of [sel, 'textarea:not([type="hidden"])', '[contenteditable="true"]', '[contenteditable="plaintext-only"]']) {
         if (!s) continue;
-        for (const el of doc.querySelectorAll(s)) {
-          if (isVisible(el)) return el;
-        }
+        const best = pickBest(doc.querySelectorAll(s));
+        if (best) return best;
       }
       for (const host of doc.querySelectorAll("*")) {
         if (host.shadowRoot) { const e = findInput(host.shadowRoot); if (e) return e; }
@@ -361,7 +377,13 @@ if (!CFG) {
     await activateSelf("say");
 
     const el = findInput();
-    if (!el) { lbLog("ERROR", "input NOT FOUND", { selector: CFG.input, hint: "site DOM changed — update SITES.input" }); throw new Error("LLM Bridge: input not found"); }
+    if (!el) {
+      lbLog("ERROR", "input NOT FOUND", { selector: CFG.input, hint: "site DOM changed — update SITES.input" });
+      // v0.9.2: report through the transport too — otherwise the engine only
+      // learns via the generic error frame and burns its reply timeout.
+      try { transport?.send({ type: "send_failed", agent: CFG.name, preview: "INPUT-NOT-FOUND: " + (CFG.input || "") }); } catch {}
+      throw new Error("LLM Bridge: input not found");
+    }
     lbLog("DEBUG", "input located", { tag: el.tagName, ce: el.getAttribute("contenteditable"), cls: String(el.className).slice(0, 60) });
 
     // v0.7: verify the site actually accepted our text before sending. If the

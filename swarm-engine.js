@@ -137,6 +137,7 @@ function sendPromptToCurrent(text) {
 function armReplyTimeout() {
   clearTimeout(ENGINE.timers.reply);
   ENGINE.timers.reply = setTimeout(() => {
+    settleAttempt(false);                             // v0.9.2: unblock any retry awaiting this attempt
     engLog("ERROR", "reply timed out — halting run gracefully", { seconds: ENGINE.timeout });
     haltAll("timeout");
     finishRun("timeout");
@@ -155,6 +156,14 @@ function coolDown(seconds) {
 }
 
 let retrying = false;
+// v0.9.2: promise-based attempt tracking. The old boolean flag was set by
+// ANY frame that touched it (including a queued say merely being accepted),
+// so cool-down retries could be declared "successful" without a real reply,
+// and a failure reported mid-retry would re-queue behind a phantom busy state
+// (user log 19:12:59: "queued newest say behind it" → instant give-up).
+let _attemptPromise = null;
+function lastAttemptSucceeded() { return _attemptPromise; }
+
 async function handleFailedTurn(fromName) {
   if (retrying || ENGINE.state !== "running") return;
   retrying = true;
@@ -162,12 +171,19 @@ async function handleFailedTurn(fromName) {
     for (const wait of [5, 10]) {
       await coolDown(wait);
       if (ENGINE.state !== "running") return;
+      // v0.9.2: force-release the target agent first — the bridge is done
+      // (it just reported failure), so any lingering busy/queue is stale.
+      releaseAgent(ENGINE.current);
       engLog("INFO", `re-dispatching current prompt to ${ENGINE.current}`, { after: wait + "s" });
+      const okP = new Promise((res) => { _attemptResolve = res; });
+      _attemptPromise = okP;
       deliver(ENGINE.current, { type: "say", text: ENGINE.lastText });
       armReplyTimeout();
-      // if this attempt succeeds, onReply clears retrying via the success path
-      await new Promise((r) => setTimeout(r, 3000));
-      if (lastAttemptSucceeded()) return;
+      // wait until THIS attempt resolves (reply / send_failed / timeout), max 45s
+      const won = await Promise.race([okP, new Promise((r) => setTimeout(() => r("timeout"), 45000))]);
+      if (won === true) { _attemptPromise = null; return; }   // attempt succeeded
+      _attemptPromise = null;
+      if (ENGINE.state !== "running") return;                  // halted meanwhile
     }
     engLog("ERROR", "give up: prompt failed after 2 cool-down retries — halting run");
     haltAll("send-failures");
@@ -175,8 +191,8 @@ async function handleFailedTurn(fromName) {
   } finally { retrying = false; }
 }
 
-let _attemptOk = false;
-function lastAttemptSucceeded() { return _attemptOk; }
+let _attemptResolve = null;
+function settleAttempt(v) { try { _attemptResolve?.(v); } catch {} _attemptResolve = null; }
 
 // ── what bridges send us ───────────────────────────────────────────────────
 function onRegister(msg, senderTabId) {
@@ -191,7 +207,7 @@ function onRegister(msg, senderTabId) {
 }
 
 function onReply(msg, fromName) {
-  _attemptOk = true;
+  settleAttempt(true);                                // v0.9.2: resolve cool-down retry
   clearTimeout(ENGINE.timers.reply);
   const from = ENGINE.agents.get(fromName);
   if (from) releaseAgent(fromName);
@@ -212,7 +228,7 @@ function onReply(msg, fromName) {
 }
 
 function onSendFailure(msg, fromName) {
-  _attemptOk = false;
+  settleAttempt(false);                               // v0.9.2: resolve cool-down retry now
   const from = ENGINE.agents.get(fromName);
   if (from) releaseAgent(fromName);
   if (ENGINE.state !== "running") return;
@@ -272,6 +288,16 @@ chrome.runtime.onMessage.addListener(async (msg, sender, respond) => {
     case "ready":          if (fromName) releaseAgent(fromName); respond({ ok: true }); return false;
     case "reply":          onReply(msg, fromName); respond({ ok: true }); return false;
     case "send_failed":    onSendFailure(msg, fromName); respond({ ok: true }); return false;
+    // v0.9.2: bridge throws this when say() fails for ANY reason (input not
+    // found, injection rejected, send channels exhausted). Without it the
+    // engine waited on its reply timeout while cool-down retries re-queued
+    // behind a phantom busy agent (user log 19:12:41→19:13:02).
+    case "error": {
+      if (ENGINE.state === "running") {
+        onSendFailure({ preview: String(msg.text || "").slice(0, 80) }, fromName);
+      }
+      respond({ ok: true }); return false;
+    }
     case "start": {
       const cfg = await chrome.storage.sync.get({ turns: 6, timeout: 180 });
       if (ENGINE.state !== "armed") arm(msg.topic || "", msg.turns || cfg.turns, msg.timeout || cfg.timeout);

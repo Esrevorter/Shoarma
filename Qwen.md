@@ -167,3 +167,10 @@ Report the PR URL back to the user.
 - If authentication fails or the remote repo does not contain the base history,
   halt and tell the user precisely which prerequisite is missing instead of
   creating a fork/orphan repo without permission.
+
+## Runtime status (updated 2026-10-15, v0.8.3)
+
+- v0.8.2 (tag `v0.8.2`, commit `db55a87`) fixed contenteditable injection, chunked retype, strict submit failure, error-toast filtering, React-state probe.
+- The live-run log of 2026-10-15 14:43–15:05 still showed a spiral: concurrent `say` frames racing on one shared input box, phantom captures of the previous turn's bubble after failed sends, and instant retry storms against a jammed editor + rate-limited site.
+- v0.8.3 fixes (this): single-flight turn guard with newest-only queue in bridge.js; baseline slice + stale-reply guard (`lastCapturedNorm`) in lastAssistantText; `clear_input` frame handled by bridge and sent by orchestrator `cool_down()` between ask_robust retries (5 s/10 s pacing). All verified: node --check, py_compile, and a scripted test proving looks_junk guards, clear_input dispatch, cooldown timing, and ask_robust recovery-on-attempt-2.
+- Branch `shoarma-v0.8-full` carries these commits; PR #2 remains open; main untouched per safety rules.

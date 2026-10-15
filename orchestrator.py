@@ -393,14 +393,20 @@ async def ask_robust(agents, pending, hub, agent, text, timeout, retries=2, cont
     """ask() + capture validation. Returns (text, ok).
     v0.8.1: per-hop fault isolation — a timeout or a disconnected tab no longer
     aborts the whole run; we substitute RETRY_NOTE and give the next hop a
-    chance to recover (a reloaded tab re-registers and resumes its slot)."""
+    chance to recover (a reloaded tab re-registers and resumes its slot).
+    v0.8.3: retry pacing. The 14:43–15:05 user log showed back-to-back re-sends
+    of the same prompt landing in an editor still jammed with the old text —
+    each retry piled on top of the previous failure. Between attempts we now
+    (a) send a clear-request so the bridge empties its stuck input box, and
+    (b) wait progressively longer (5 s, 10 s) before re-dispatching."""
     for attempt in range(retries + 1):
         try:
             got = await ask(agents, pending, hub, agent, text, timeout, control)
         except asyncio.TimeoutError:
             hub.add({"type": "log", "agent": agent, "level": "WARN",
                      "msg": f"hop timed out after {timeout}s (attempt {attempt + 1})"})
-            emit(f"[{agent}] hop timed out — retrying this hop…", hub)
+            emit(f"[{agent}] hop timed out — cooling down before retry…", hub)
+            await cool_down(agents, agent, attempt)
             continue
         except ConnectionError as e:
             hub.add({"type": "log", "agent": agent, "level": "WARN",
@@ -419,8 +425,23 @@ async def ask_robust(agents, pending, hub, agent, text, timeout, retries=2, cont
             return got, True
         hub.add({"type": "log", "agent": agent, "level": "WARN",
                  "msg": f"capture failed (attempt {attempt + 1}) — retrying hop"})
-        emit(f"[{agent}] capture failed, retrying this hop…", hub)
+        emit(f"[{agent}] capture failed, cooling down before retry…", hub)
+        await cool_down(agents, agent, attempt)
     return RETRY_NOTE, False
+
+
+async def cool_down(agents, agent, attempt):
+    """v0.8.3: between failed hops, tell the bridge to flush any text still
+    stuck in its input box, then pause so the site's rate limiter recovers.
+    Without this, every retry typed into a full editor and the failure
+    compounded into the spiral seen in the 14:43+ log."""
+    try:
+        if agent in agents:
+            await agents[agent].send(json.dumps({"type": "clear_input"}))
+    except Exception:
+        pass                                          # tab may be gone; handled next loop
+    delay = 5 * (attempt + 1)                         # 5 s, 10 s, 15 s …
+    await asyncio.sleep(delay)
 
 
 async def main():

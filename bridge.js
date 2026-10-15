@@ -53,6 +53,8 @@ if (!CFG) {
   console.warn("LLM Bridge: no site config for", location.hostname);
 } else {
   const state = { halted: false, ws: null, turns: 0, lastMs: 0, lastState: "connecting" };
+  let busy = false;                                   // v0.8.3: single-flight turn guard
+  let pendingSay = null;                              // v0.8.3: newest say queued while busy
 
   // ── Monitor feed (v0.4): the orchestrator mirrors everything into a Hub that
   //    the third-page live monitor polls. We push HUD state changes upstream so
@@ -287,6 +289,7 @@ if (!CFG) {
   // captured as a whole reply (user log 10:48:07/10:48:32). Treat it as chrome.
   const CHROME_EXACT = /^(thinking completed|deep thinking|analyzing\.\.\.|stop|new chat|scroll to top)[\s.!…]*$/i;
   let lastSentText = "";
+  let lastCapturedNorm = "";                          // v0.8.3: stale-reply guard
 
   function isInsideUserTurn(el) {
     for (let n = el, d = 0; n && d < 12; n = n.parentElement, d++) {
@@ -612,8 +615,14 @@ if (!CFG) {
     return false;
   }
 
-  function lastAssistantText() {
-    const nodes = assistantNodes();
+  function lastAssistantText(baseline = -1) {
+    let nodes = assistantNodes();
+    // v0.8.3: FRESH-BUBBLE GUARANTEE. The user log showed byte-identical
+    // replies captured seconds after a FAILED send (turns #4/#10/#11 relayed
+    // the same 9364-char text). Bubbles can be re-rendered/reordered so the
+    // plain index cut misses; now we additionally require that the chosen
+    // bubble is NOT a known previous-turn text before accepting it.
+    if (baseline >= 0 && nodes.length > baseline) nodes = nodes.slice(baseline);
     lbLog("DEBUG", "scanning assistant bubbles", { candidates: nodes.length });
     for (let i = nodes.length - 1; i >= 0; i--) {
       let t = "";
@@ -623,8 +632,14 @@ if (!CFG) {
       // ECHO GUARD: never accept our own prompt back as a reply — this was the
       // single biggest desync source (the debate then loops on stale text).
       if (lastSentText && norm(t) === norm(lastSentText)) { lbLog("WARN", "skipped echoed prompt bubble", { chars: t.length }); continue; }
+      // v0.8.3: stale-reply guard — a bubble whose text equals the reply we
+      // ALREADY relayed last turn is not new; skipping it turns the phantom
+      // "byte-identical reply seconds after a failed send" into an honest
+      // "(no response captured)" that ask_robust retries instead of relaying.
+      if (lastCapturedNorm && norm(t) === lastCapturedNorm) { lbLog("WARN", "skipped stale previous-turn reply", { chars: t.length }); continue; }
       if (looksLikeChrome(t)) { lbLog("WARN", "skipped UI-chrome string", { preview: t.slice(0, 40) }); continue; }
       lbLog("INFO", "captured reply", { chars: t.length, preview: t.slice(0, 80) });
+      lastCapturedNorm = norm(t);                     // remember for next turn
       return t;
     }
     // Full diagnostic instead of a bare "(no response captured)":
@@ -742,6 +757,20 @@ if (!CFG) {
 
     ws.onmessage = async (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch (e) { lbLog("ERROR", "bad frame from orchestrator (JSON parse)", { raw: String(ev.data).slice(0, 200), err: String(e) }); return; }
+      if (msg.type === "clear_input") {                // v0.8.3: orchestrator asks us to flush a jammed editor before retrying
+        try {
+          const el = findInput();
+          if (el && readBox(el).trim()) {
+            setNativeValue(el, "");
+            if (isCE(el)) { try { document.execCommand("selectAll"); document.execCommand("delete"); } catch {} }
+            el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
+            lbLog("INFO", "clear_input: flushed stuck text from input box", { chars: String(msg.text || "").length });
+          } else {
+            lbLog("DEBUG", "clear_input: box already empty");
+          }
+        } catch (e) { lbLog("WARN", "clear_input failed", { err: String(e).slice(0, 100) }); }
+        return;
+      }
       if (msg.type === "resume") { lbLog("INFO", "orchestrator mid-run — tab rejoined"); hud("thinking…"); return; }
       if (msg.type === "swarm") {                      // armed/running/done mirror
         state.swarm = msg.state;
@@ -756,23 +785,44 @@ if (!CFG) {
 
       const t0 = performance.now();
       lbLog("INFO", `turn #${state.turns + 1}: received prompt`, { chars: String(msg.text).length, preview: String(msg.text).slice(0, 80) });
+      if (busy) {                                      // v0.8.3: single-flight guard.
+        lbLog("WARN", "say arrived while a turn is still in flight — queueing behind it",
+              { preview: String(msg.text).slice(0, 40) });
+        pendingSay = String(msg.text);                 // keep only the newest; older dupes were the retry storm
+        return;
+      }
+      busy = true;
       try {
         hud("writing…");
-        const baseline = assistantNodes().length;     // bubble count BEFORE send
-        await say(msg.text);
-        hud("thinking…");
-        await waitForStart(15000, baseline);          // stop button OR new bubble
-        await waitForIdle();
-        const text = await captureReply(baseline);    // + truncation re-check
+        let textToSay = String(msg.text);
+        let textP = "(no response captured)";
+        for (;;) {
+          const baseline = assistantNodes().length;    // bubble count BEFORE send
+          await say(textToSay);
+          hud("thinking…");
+          await waitForStart(15000, baseline);         // stop button OR new bubble
+          await waitForIdle();
+          textP = await captureReply(baseline);        // + truncation re-check
+          if (textP !== "(no response captured)" || !pendingSay) break;
+          textToSay = pendingSay;                      // failed phantom turn — resend what we have queued
+          pendingSay = null;
+        }
         state.turns++;
         state.lastMs = performance.now() - t0;
-        lbLog("INFO", `turn #${state.turns} complete`, { seconds: +(state.lastMs / 1000).toFixed(1), replyChars: text.length });
+        lbLog("INFO", `turn #${state.turns} complete`, { seconds: +(state.lastMs / 1000).toFixed(1), replyChars: textP.length });
         hud("idle");
-        ws.send(JSON.stringify({ type: "reply", agent: CFG.name, text }));
+        ws.send(JSON.stringify({ type: "reply", agent: CFG.name, text: textP }));
       } catch (e) {
         lbLog("ERROR", "turn FAILED", { error: String(e), stack: String(e.stack).split("\n").slice(0, 3).join(" | ") });
         hud("error");
         ws.send(JSON.stringify({ type: "error", agent: CFG.name, text: String(e) }));
+      } finally {
+        busy = false;
+        if (pendingSay && !state.halted) {             // drain queued say after failure/idle capture
+          const q = pendingSay; pendingSay = null;
+          lbLog("INFO", "draining queued say", { chars: q.length });
+          ws.onmessage({ data: JSON.stringify({ type: "say", text: q }) });
+        }
       }
     };
 

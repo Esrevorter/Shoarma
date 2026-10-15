@@ -11,3 +11,4 @@ transcript-*.json
 debug-*.log
 monitor-port.txt
 ws-port.txt
+hop/

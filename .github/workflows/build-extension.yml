@@ -29,20 +29,22 @@ jobs:
         run: |
           python -m json.tool manifest.json > /dev/null
           node --check bridge.js
+          node --check swarm-engine.js
           node --check popup.js
-                    node --check monitor.js
+          node --check monitor.js
           python -m py_compile orchestrator.py launcher.py scripts/*.py
           echo "✔ all sources valid"
 
-      - name: Package extension (flat zip — unzip → chrome://extensions → Load unpacked)
+      - name: Package extension (canonical build via tools/build_release.py)
+        # v0.9.5: the hand-rolled `zip` command here was the bug — it shipped a
+        # legacy file set (no swarm-engine.js, stale background-era files) that
+        # Chrome could not load ("Could not load background script ''"). The CI
+        # now runs the same validator+builder used locally, which refuses to
+        # ship unless every manifest-referenced path exists and no retired
+        # files are included.
         run: |
-          mkdir -p dist
-          zip -r "dist/shoarma-extension-v${{ steps.ver.outputs.version }}.zip" \
-            manifest.json bridge.js hud.css popup.html popup.css popup.js \
-            monitor.html monitor.css monitor.js \
-            orchestrator.py icons/ launcher/ \
-            -x "*.DS_Store"
-          unzip -l "dist/shoarma-extension-v${{ steps.ver.outputs.version }}.zip"
+          python3 tools/build_release.py
+          ls -la dist/
 
       - name: Upload artifact (any branch/PR)
         uses: actions/upload-artifact@v4

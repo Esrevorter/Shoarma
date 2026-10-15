@@ -14,14 +14,27 @@
     <span id="ver" class="ver"></span>
   </header>
 
-  <!-- one click: start the referee, no terminal needed -->
+  <!-- guided stepper: one clear next action at a time -->
+  <nav class="steps" aria-label="setup progress">
+    <span class="step" data-step="1"><i>1</i> Open tabs</span>
+    <span class="bar"></span>
+    <span class="step" data-step="2"><i>2</i> Launch</span>
+    <span class="bar"></span>
+    <span class="step" data-step="3"><i>3</i> Watch live</span>
+  </nav>
+
   <section class="card launch">
-    <button id="launch" class="big">🚀 Launch swarm</button>
-    <p id="launch-hint" class="hint">Starts the orchestrator with your settings below — no terminal required.</p>
-    <button id="monitor" class="ghost">📟 Open live monitor</button>
+    <p id="coach" class="coach">👋 Step 1 — open logged-in tabs of chat.deepseek.com and chat.qwen.ai. I'll tell you when both agents are wired.</p>
+    <div class="progress"><div id="pbar" class="pbar" style="width:0%"></div></div>
+    <p id="ptext" class="ptext"></p>
+    <div class="row">
+      <button id="launch" class="big">🚀 Launch swarm</button>
+      <button id="monitor" class="ghost side">📟 Live monitor</button>
+    </div>
+    <p id="launch-hint" class="hint"></p>
   </section>
 
-  <details class="card" open>
+  <details class="card">
     <summary>Settings <span class="tag">saved automatically</span></summary>
 
     <label class="field">
@@ -48,13 +61,20 @@
       <input id="halted" type="checkbox" />
       <span>Halt all agents <em>(kill switch — also Esc in any tab)</em></span>
     </label>
-
-    <button id="push" class="ghost">Apply to open tabs</button>
   </details>
 
   <section class="card">
     <div id="status" class="status"><span class="dot"></span> scanning tabs…</div>
     <ul id="tabs"></ul>
+  </section>
+
+  <section class="card activity">
+    <div class="act-head">
+      <b>Activity</b>
+      <button id="copy-log" class="mini">📋 Copy all</button>
+      <button id="clear-log" class="mini ghost-mini">Clear</button>
+    </div>
+    <pre id="activity" class="activity"></pre>
   </section>
 
   <footer>

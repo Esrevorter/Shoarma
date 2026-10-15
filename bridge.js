@@ -268,9 +268,9 @@ if (!CFG) {
       <span class="lb-agent">${CFG.name}</span>
       <span class="lb-state">connecting…</span>
       <span class="lb-stats"></span>
-      <button class="lb-btn lb-danger" title="Halt / resume (Esc)">HALT</button>
+      <button class="lb-btn lb-danger" title="Pause / resume this agent (Esc)">⏸ Pause</button>
       <button class="lb-btn" id="lb-copy" title="Copy debug log to clipboard">📋</button>
-      <button class="lb-btn" title="Collapse">—</button>`;
+      <button class="lb-btn lb-hide" title="Hide this pill — Esc brings it back, and the Live monitor keeps watching">✕</button>`;
     // inline fallback in case the page's CSP blocks the content-script stylesheet
     box.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;" +
       "display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:14px;" +
@@ -278,7 +278,7 @@ if (!CFG) {
       "border:1px solid #fff2;opacity:.9";
     document.body.appendChild(box);
     box.querySelector(".lb-danger").onclick = () => toggleHalt();
-    box.querySelectorAll(".lb-btn")[1].onclick = () => box.classList.toggle("lb-min");
+    box.querySelector(".lb-hide").onclick = () => hudEl.classList.toggle("lb-hidden");
     box.querySelector("#lb-copy").onclick = async (ev) => {
       const btn = ev.currentTarget;
       try { await navigator.clipboard.writeText(globalThis.__lbLog()); }

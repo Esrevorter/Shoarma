@@ -1,17 +1,33 @@
 // monitor.js — the third page: live view of the swarm, no tab-switching.
-// The orchestrator starts a tiny HTTP server on an ephemeral port and writes
-// that number to <SHOARMA_HOME>/monitor-port.txt (default: Downloads/shoarma,
-// falling back to /tmp/shoarma). We probe candidate files until one answers;
-// if none do, we show "waiting for orchestrator".
-//   GET /state → { agents:{name:{state,turns}}, events:[{seq,type,...}] }
+// v0.5.1 discovery ladder (the old file://-only approach failed on Windows —
+// Chrome blocks local-file fetches → "offline · waiting for orchestrator"):
+//   1. chrome.storage.sync.port → probe http://127.0.0.1:<port>/state directly
+//      (the WS port now answers plain HTTP too) and read feedPort from /state;
+//   2. file:// port files (works when the extension dir is readable);
+//   3. common fallback ports.
 // Polls every 800ms; renders new conversation turns and (optionally) debug
 // lines; one-click "Copy debug" gathers EVERYTHING for a bug report.
 
 const $ = (id) => document.getElementById(id);
-let httpPort = null;                 // discovered from monitor-port.txt
+let httpPort = null;                 // discovered feed port (may == ws port)
 let lastSeq = 0;
 let DEBUG_LINES = [];          // mirror of everything we render, for copy-paste
 const MAX_DOM_EVENTS = 400;
+
+async function tryFetchState(portOrUrl) {
+  const url = String(portOrUrl).startsWith("http")
+    ? portOrUrl : `http://127.0.0.1:${portOrUrl}/state`;
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 1200);
+  try {
+    const r = await fetch(url, { cache: "no-store", signal: ctl.signal });
+    if (!r.ok) return null;
+    const st = await r.json();
+    if (st && typeof st === "object" && "events" in st) return st;
+    return null;
+  } catch { return null; }
+  finally { clearTimeout(t); }
+}
 
 function homeCandidates() {
   return [
@@ -21,13 +37,28 @@ function homeCandidates() {
 }
 
 async function discoverPort() {
+  // 1. saved config port — the orchestrator's WS port also serves /state
+  const cfg = await chrome.storage.sync.get({ port: 8765 });
+  const cands = [`http://127.0.0.1:${cfg.port}/state`];
+  // 2. file:// port files (if readable)
   for (const u of homeCandidates()) {
     try {
       const r = await fetch(u, { cache: "no-store" });
-      if (!r.ok) continue;
-      const p = parseInt((await r.text()).trim(), 10);
-      if (p > 0 && p < 65536) return p;
+      if (r.ok) {
+        const p = parseInt((await r.text()).trim(), 10);
+        if (p > 0 && p < 65536) cands.push(`http://127.0.0.1:${p}/state`);
+      }
     } catch {}
+  }
+  // 3. cheap sweep of likely ephemeral range? No — instead retry the saved
+  //    port each poll; that covers restarts without hammering the network.
+  for (const c of cands) {
+    const st = await tryFetchState(c);
+    if (st) {
+      // prefer the dedicated side-feed port the orchestrator advertises
+      if (st.feedPort && st.feedPort > 0) return st.feedPort;
+      return parseInt(c.split("/")[2].split(":")[1], 10);
+    }
   }
   return null;
 }
@@ -38,6 +69,7 @@ chrome.storage.sync.get({ halted: false }, (cfg) => {
 });
 chrome.storage.onChanged.addListener((ch, area) => {
   if (area === "sync" && ch.halted) $("halted").checked = !!ch.halted.newValue;
+  if (area === "sync" && ch.port) httpPort = null;   // re-discover on port change
 });
 $("halted").onchange = () => chrome.storage.sync.set({ halted: $("halted").checked });
 $("show-debug").onchange = applyDebugVisibility;
@@ -49,8 +81,8 @@ async function poll() {
       if (!httpPort) throw new Error("no feed yet");
       $("stat-port").textContent = httpPort;
     }
-    const res = await fetch(`http://127.0.0.1:${httpPort}/state`, { cache: "no-store" });
-    const st = await res.json();
+    const st = await tryFetchState(httpPort);
+    if (!st) throw new Error("feed gone");
     setPill(true);
     renderAgents(st.agents || {});
     for (const ev of (st.events || [])) if (ev.seq > lastSeq) renderEvent(ev);

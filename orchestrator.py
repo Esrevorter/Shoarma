@@ -1,7 +1,10 @@
 # orchestrator.py — router + turn governor for the LLM Bridge swarm.
-# v0.4: in-process HTTP side-server on the SAME port serves GET /state to the
-#       live monitor page (extension tab) — no terminal watching needed.
-#       Agent debug frames are recorded into the event feed + run log.
+# v0.5.1: monitor discovery hardened — the WS port itself now answers plain
+#       HTTP GET /state and /monitor-port.txt (websockets process_request),
+#       so the monitor page can always find the feed even when file:// port
+#       files are unreadable (Windows Chrome blocks local-file fetches).
+#       Also: graceful stand-down if a second instance is launched, unified
+#       centralized run.log, popup stepper/progress/activity-log assets kept.
 # pip install websockets
 
 import argparse, asyncio, json, logging, os, time
@@ -51,12 +54,15 @@ def emit(line: str, hub=None):
 
 
 class Hub:
-    """Ring buffer of events + per-agent state, exposed to the monitor page."""
-    def __init__(self, max_events=500):
+    """Ring buffer of events + per-agent state, exposed to the monitor page.
+    Centralized log: every event is ALSO appended to run.log as it happens,
+    so a single copy-pasteable file holds orchestrator + agent debug output."""
+    def __init__(self, max_events=500, log_path: Path | None = None):
         self.events: list[dict] = []
         self.agents: dict[str, dict] = {}
         self.seq = 0
         self.max = max_events
+        self.log_path = log_path
 
     def add(self, ev: dict) -> int:
         self.seq += 1
@@ -64,14 +70,25 @@ class Hub:
         self.events.append(ev)
         if len(self.events) > self.max:
             del self.events[: len(self.events) - self.max]
+        if self.log_path:
+            try:
+                line = (f"{ev['ts']} {ev.get('level','SYS').upper():5} "
+                        f"[{ev.get('agent','orch')}] {ev.get('msg') or ev.get('text','')}")
+                d = ev.get("data")
+                if d:
+                    line += f" :: {json.dumps(d, ensure_ascii=False)[:300]}"
+                with open(self.log_path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass                     # logging must never kill the run
         return self.seq
 
     def agent(self, name: str, **kw):
         self.agents.setdefault(name, {"state": "?", "turns": 0}).update(kw)
 
-    def snapshot(self) -> bytes:
+    def snapshot(self, feed_port: int | None = None) -> bytes:
         return json.dumps({"agents": self.agents, "events": self.events,
-                           "seq": self.seq}).encode()
+                           "seq": self.seq, "feedPort": feed_port}).encode()
 
 
 async def http_side_server(hub: Hub, path: Path):
@@ -97,6 +114,57 @@ async def http_side_server(hub: Hub, path: Path):
     port = srv.sockets[0].getsockname()[1]
     write_utf8(path.parent / "monitor-port.txt", str(port))
     return srv, port
+
+
+def make_process_request(hub_ref: dict):
+    """v0.5.1 fix — the monitor page used to show 'offline · waiting for
+    orchestrator' forever because it could only find the feed via file://
+    port files, which Chrome blocks on Windows. Now the WS port itself
+    answers plain HTTP: GET /state and GET /monitor-port.txt.
+
+    websockets v13+ (asyncio impl) requires returning a Response object;
+    older versions want a base64 raw-response string. We support both.
+    Returning None lets the normal WebSocket handshake proceed for agents."""
+    try:                                   # modern API (websockets >= 13)
+        from websockets.http11 import Response
+        from websockets.datastructures import Headers
+    except ImportError:                    # pragma: no cover — old lib fallback
+        Response = Headers = None
+
+    def _body_bytes(status: str, body: bytes, ctype="application/json"):
+        hdrs = ("HTTP/1.1 " + status,
+                f"Date: {time.strftime('%a, %d %b %Y %H:%M:%S GMT')}",
+                f"Content-Type: {ctype}",
+                f"Content-Length: {len(body)}",
+                "Access-Control-Allow-Origin: *",
+                "Connection: close")
+        return ("\r\n".join(hdrs) + "\r\n\r\n").encode() + body
+
+    def _make_response(code: int, reason: str, body: bytes, ctype: str):
+        if Response is not None:
+            headers = Headers({
+                "Content-Type": ctype,
+                "Content-Length": str(len(body)),
+                "Access-Control-Allow-Origin": "*",
+                "Connection": "close",
+            })
+            return Response(code, reason, headers, body)
+        import base64
+        return base64.b64encode(_body_bytes(f"{code} {reason}", body, ctype)).decode()
+
+    async def process_request(connection, request):
+        p = getattr(request, "path", "") or ""
+        if p.startswith("/state"):
+            fp = hub_ref.get("feed_port")
+            return _make_response(200, "OK",
+                                  hub_ref["hub"].snapshot(feed_port=fp),
+                                  "application/json")
+        if p.startswith("/monitor-port.txt"):
+            fp = hub_ref.get("feed_port")
+            if fp:
+                return _make_response(200, "OK", str(fp).encode(), "text/plain")
+        return None          # everything else → normal WebSocket handshake
+    return process_request
 
 
 def write_utf8(path: Path, text: str):
@@ -157,6 +225,17 @@ async def ask(agents: dict, pending: dict, hub: Hub, agent: str, text: str, time
     return await asyncio.wait_for(fut, timeout)
 
 
+def port_in_use(port: int) -> bool:
+    """True if something already listens on 127.0.0.1:port (another swarm)."""
+    import socket
+    s = socket.socket()
+    s.settimeout(0.4)
+    try:
+        return s.connect_ex((HOST, port)) == 0
+    finally:
+        s.close()
+
+
 async def main():
     s = load_settings()
     ap = argparse.ArgumentParser(description="LLM Bridge orchestrator")
@@ -166,25 +245,34 @@ async def main():
     ap.add_argument("--port", type=int, default=s["port"])
     args = ap.parse_args()
 
+    # graceful stand-down: a second launch must not crash with OSError 10048
+    # or hijack a running swarm — detect, report the live feed URL, exit 0.
+    if port_in_use(args.port):
+        print(f"[shoarma] a swarm is already running on port {args.port}.", flush=True)
+        print(f"[shoarma] standing down — nothing to do. Watch it live in the "
+              f"Shoarma Monitor tab, or close the other orchestrator first.", flush=True)
+        return
+
     opening = args.topic or s["topic"] or OPENING
     order = ("qwen", "deepseek")
     agents: dict[str, object] = {}
     pending: dict[str, asyncio.Future] = {}
     transcript: list[dict] = []
-    hub = Hub()
 
     run_dir = Path(os.environ.get("SHOARMA_HOME", "."))
     run_dir.mkdir(parents=True, exist_ok=True)
     tstamp = time.strftime("%Y%m%d-%H%M%S")
     out_path = run_dir / f"transcript-{tstamp}.json"
-    log_path = run_dir / f"run-{tstamp}.log"
+    log_path = run_dir / f"run-{tstamp}.log"          # centralized copy-paste log
     debug_path = run_dir / f"debug-{tstamp}.log"
+    hub = Hub(log_path=log_path)                       # every event → run.log too
 
     ws_log_handler = logging.FileHandler(debug_path, encoding="utf-8")
     ws_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logging.getLogger("websockets").addHandler(ws_log_handler)
 
     side_srv, http_port = await http_side_server(hub, log_path)
+    hub_ref = {"hub": hub, "feed_port": http_port}     # shared with WS-port HTTP
     try:                                   # also publish the WS port so the
         write_utf8(run_dir / "ws-port.txt", str(args.port))  # extension can find us on custom ports
     except Exception:
@@ -196,9 +284,11 @@ async def main():
     except OSError:
         pass
     async with __import__("websockets").serve(
-            lambda ws: handler(ws, agents, pending, hub), HOST, args.port):
+            lambda ws: handler(ws, agents, pending, hub), HOST, args.port,
+            process_request=make_process_request(hub_ref)):
         emit(f"ws://{HOST}:{args.port} — open both tabs, waiting for {sorted(AGENTS_EXPECTED)}", hub)
-        emit(f"live monitor feed: http://127.0.0.1:{http_port}/state  (open the Shoarma Monitor tab)", hub)
+        emit(f"live monitor feed: http://127.0.0.1:{http_port}/state  "
+             f"(also served directly on http://127.0.0.1:{args.port}/state)", hub)
         while not AGENTS_EXPECTED.issubset(agents):
             await asyncio.sleep(0.3)          # snappier readiness detection
         emit("both agents online. starting.\n", hub)
@@ -237,12 +327,14 @@ async def main():
             emit(f"\nsaved {len(transcript)} turns → {out_path}", hub)
         else:
             emit(f"partial transcript saved → {out_path}", hub)
-        write_utf8(log_path, "\n".join(t["text"] for t in transcript) or "(empty)")
-        write_utf8(debug_path, "\n".join(
+        # run.log is the ONE centralized copy-paste file: Hub appended every
+        # orchestrator + agent event to it live; now top it up with a summary.
+        write_utf8(run_dir / "run.log", "\n".join(
             f"{e['ts']} {e.get('level','SYS').upper():5} [{e.get('agent','orch')}] "
             f"{e.get('msg') or e.get('text','')}"
-            + (f" :: {json.dumps(e['data'])[:300]}" if e.get("data") else "")
-            for e in hub.events if e["type"] in ("log", "sys")))
+            + (f" :: {json.dumps(e['data'], ensure_ascii=False)[:300]}" if e.get("data") else "")
+            for e in hub.events))
+        emit(f"(full centralized log: {(run_dir / 'run.log')} — copy-paste that to report bugs)", hub)
         emit(f"(live feed stays up at http://127.0.0.1:{http_port}/state for 60s…)", hub)
         await asyncio.sleep(60)   # keep monitor readable briefly after the run
         side_srv.close()

@@ -1,9 +1,11 @@
 __pycache__/
 *.pyc
-settings.json
-transcript*.json
-run-*.log
-launcher.log
-.DS_Store
-dist/
+*.log
 .env
+
+.env
+run.log
+ws-*.log
+__pycache__/
+transcript-*.json
+debug-*.log

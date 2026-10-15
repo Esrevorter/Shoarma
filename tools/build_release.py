@@ -22,7 +22,6 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXTENSION_FILES = [
     "manifest.json",
     "swarm-engine.js",
-    "background.js",
     "bridge.js",
     "popup.html",
     "popup.css",
@@ -40,7 +39,14 @@ JUNK = re.compile(r"(\.DS_Store|__pycache__|\.log$|^Qwen\.md$|\.env$)")
 
 
 def referenced_paths(manifest):
-    yield manifest["background"]["service_worker"]
+    # v0.9.4b: the in-browser engine registers its listeners from content-bridge
+    # messages, so there is intentionally NO background/service_worker anymore.
+    # If one ever comes back, it must name a real file.
+    sw = manifest.get("background", {}).get("service_worker")
+    if sw is not None:
+        assert isinstance(sw, str) and sw.strip(), \
+            "FATAL: background.service_worker is empty — Chrome would abort with \"Could not load background script ''\""
+        yield sw
     yield manifest["action"]["default_popup"]
     for cs in manifest.get("content_scripts", []):
         yield from cs.get("js", [])
@@ -60,15 +66,13 @@ def validate():
         m = json.load(f)
 
     sw = m.get("background", {}).get("service_worker", "")
-    assert isinstance(sw, str) and sw.strip(), \
-        "FATAL: background.service_worker is empty — Chrome would abort with \"Could not load background script ''\""
 
     missing = sorted({p for p in referenced_paths(m) if not os.path.exists(os.path.join(REPO, p))})
     assert not missing, f"FATAL: manifest references missing files: {missing}"
 
     extra = sorted({p for p in EXTENSION_FILES if os.path.exists(os.path.join(REPO, p))})
     version = m["version"]
-    print(f"manifest OK — version {version}, service_worker '{sw}', "
+    print(f"manifest OK — version {version}, background worker: {'none (v0.9.5+)' if not sw else repr(sw)}, "
           f"{len(list(referenced_paths(m)))} referenced paths all present")
     return version, sorted(set(EXTENSION_FILES) | set(extra))
 

@@ -1,14 +1,1 @@
-__pycache__/
-*.pyc
-*.log
-.env
-
-.env
-run.log
-ws-*.log
-__pycache__/
-transcript-*.json
-debug-*.log
-monitor-port.txt
-ws-port.txt
-hop/
+dist/

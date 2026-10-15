@@ -1,19 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Shoarma",
-  "version": "0.9.4",
-  "description": "Bridges two authenticated LLM web UIs into a self-driving conversation — fully browser-based.",
+  "version": "0.9.5",
+  "description": "Bridges two authenticated LLM web UIs into a self-driving conversation \u2014 fully browser-based.",
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Shoarma — LLM Bridge control deck",
+    "default_title": "Shoarma \u2014 LLM Bridge control deck",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }
-  },
-  "background": {
-    "service_worker": "swarm-engine.js"
   },
   "icons": {
     "16": "icons/icon16.png",

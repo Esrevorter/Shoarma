@@ -397,7 +397,18 @@ function downloadLastTranscript() {
 }
 
 // ── message router (this is the "WebSocket server", minus the socket) ──────
-chrome.runtime.onMessage.addListener(async (msg, sender, respond) => {
+// NOTE: the listener must be registered SYNCHRONOUSLY. MV3 decides whether to
+// keep the message channel open for sendResponse based on what the listener
+// returns *synchronously* — an `async` callback always returns a Promise
+// (truthy but not `true`), which is unreliable across Chrome versions and can
+// silently drop responses. The handler itself stays async; we just bridge it.
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  handleEngineMessage(msg, sender, respond).catch(e => {
+    try { respond({ ok: false, error: String(e && e.message || e) }); } catch {}
+  });
+});
+
+async function handleEngineMessage(msg, sender, respond) {
   const tabId = sender.tab?.id;
   const fromName = String(msg?.agent || "").toLowerCase();
   switch (msg?.type) {
@@ -465,7 +476,7 @@ chrome.runtime.onMessage.addListener(async (msg, sender, respond) => {
       return false;
     default: return false; // status / log reach the bridges directly
   }
-});
+}
 
 // ── tab focus helper (v0.8 semantics, moved here from background.js) ───────
 let lastFocus = { tabId: -1, ts: 0 };

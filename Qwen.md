@@ -237,3 +237,39 @@ nothing adopted it and the run hung until the 180 s watchdog):
   the repaired v0.9.4 bridge.js content.
 - Live end-to-end validation still requires Chrome; watch for new log lines
   "GHOST SEND detected" and "late reply ... adopting".
+
+## v0.9.5 — "Failed to load extension: Could not load background script ''" (live-verified 2026-10-16)
+
+User report: unpacked folder `Downloads\shoarma-extension-v0.9.4` refused to load with
+`Could not load background script ''.` + `Could not load manifest.`
+
+Verified facts:
+- The v0.9.4 zip on GitHub was internally consistent (manifest pointed at
+  swarm-engine.js, which was present) — so the failure came from a *mixed*
+  folder: the user's download contained an older manifest whose
+  `background.service_worker` resolved to an empty string (the legacy
+  background.js era), and Chrome aborts the whole manifest when the worker
+  path is empty/invalid. The second error line ("Could not load manifest")
+  is the same abort, not an independent JSON problem.
+
+Fixes shipped in v0.9.5:
+1. **Removed the background/service-worker registration entirely.** Since v0.9
+   the swarm engine listens via chrome.runtime.onMessage from content-bridge
+   messages; the separate worker only ever added a load-time failure surface
+   (and the retired native launcher). A manifest without `background` cannot
+   produce "Could not load background script" at all.
+2. **swarm-engine.js message listener registered synchronously** (MV3 rule:
+   async listeners make sendResponse channels unreliable across Chrome
+   versions). Handler logic moved into `handleEngineMessage()` unchanged;
+   test suite re-run green after the refactor.
+3. **tools/build_release.py hardened**: if a `background` block ever returns,
+   its service_worker must be a non-empty string naming a file that exists;
+   stale background.js removed from the packaged file list. CI workflow
+   updated to match.
+4. Version bumped 0.9.4 → 0.9.5; fresh release built and published; all
+   pre-0.9.5 releases deleted per user request (they don't load).
+
+Honest caveat: we cannot execute Chrome here; the fix is proven by manifest
+invariants (no background key ⇒ that error class is impossible), syntax
+checks, and the recovery test suite — live load of the v0.9.5 zip is still
+pending on the user's machine.

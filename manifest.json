@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Shoarma",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Bridges two authenticated LLM web UIs into a self-driving conversation — fully browser-based.",
   "action": {
     "default_popup": "popup.html",
@@ -42,15 +42,6 @@
     {
       "resources": [
         "hud.css"
-      ],
-      "matches": [
-        "https://chat.deepseek.com/*",
-        "https://chat.qwen.ai/*"
-      ]
-    },
-    {
-      "resources": [
-        "orchestrator.py"
       ],
       "matches": [
         "https://chat.deepseek.com/*",

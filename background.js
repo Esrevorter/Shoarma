@@ -26,7 +26,36 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     respond({ ok: true });
     return false;
   }
+  // ── v0.8: tab activation ────────────────────────────────────────────────
+  // Sites throttle background tabs (React timers, input handlers, even the
+  // WebSocket), so before every say()/confirm() the bridge asks US to bring
+  // its own tab to the foreground — fully automated, no user interaction.
+  // chrome.tabs.update(tab.id, {active:true}) activates the tab AND focuses
+  // its window. We debounce per-tab so rapid-fire requests don't thrash.
+  if (msg?.type === "activate-tab") {
+    const tabId = sender.tab?.id;
+    if (tabId == null) { respond({ ok: false, error: "no tab" }); return false; }
+    focusTab(tabId).then(
+      () => respond({ ok: true }),
+      (e) => respond({ ok: false, error: String(e && e.message || e) })
+    );
+    return true;
+  }
 });
+
+let lastFocus = { tabId: -1, ts: 0 };
+async function focusTab(tabId) {
+  const now = Date.now();
+  if (tabId === lastFocus.tabId && now - lastFocus.ts < 400) return;  // already focused
+  lastFocus = { tabId, ts: now };
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab.active) {
+    await chrome.tabs.update(tabId, { active: true });
+  }
+  if (tab.windowId != null) {
+    try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {}
+  }
+}
 
 async function launch() {
   const cfg = await chrome.storage.sync.get({ turns: 6, timeout: 180, port: 8765, topic: "" });

@@ -277,13 +277,26 @@ RETRY_NOTE = ("(Your previous message did not reach me — the bridge lost my "
               "reply. Please restate your last point briefly and continue the "
               "debate.)")
 
+# v0.8: some placeholder junk slipped through the exact-match check (the agent
+# literally RECEIVED "(no response captured)" as its prompt and then politely
+# complained about it — see user log 10:47:58). Any reply that CONTAINS one of
+# these strings is a failed capture, and if we can't recover it we substitute
+# RETRY_NOTE so the other debater never sees bridge internals.
+CAPTURE_JUNK = ("(no response captured)", "ERR ", "[Shoarma", "undefined",
+                "Thinking completed")
+
+
+def looks_junk(t):
+    tl = t.lower()
+    return (t.startswith("ERR") or len(t.strip()) < 3
+            or any(j.lower() in tl for j in CAPTURE_JUNK))
+
 
 async def ask_robust(agents, pending, hub, agent, text, timeout, retries=1):
     """ask() + capture validation. Returns (text, ok)."""
     for attempt in range(retries + 1):
         got = await ask(agents, pending, hub, agent, text, timeout)
-        bad = got.startswith("ERR") or "(no response captured)" in got or len(got.strip()) < 3
-        if not bad:
+        if not looks_junk(got):
             return got, True
         hub.add({"type": "log", "agent": agent, "level": "WARN",
                  "msg": f"capture failed (attempt {attempt + 1}) — retrying hop"})

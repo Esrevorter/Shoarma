@@ -202,6 +202,9 @@ if (!CFG) {
   const BUBBLE_CANDIDATES = '[data-role="assistant"], [data-message-author-role="assistant"], [data-turn-role="assistant"], [class*="assistant"] [class*="content"], [class*="reply-content"], [class*="markdown"]';
   const USER_HINT = /user|human|question|query|prompt/i;
   const CHROME_HINT = /prefer this|thumbs|good response|bad response|copy|regenerate|like|dislike/i;
+  // v0.8: qwen's collapsed-reasoning header reads "Thinking completed" and was
+  // captured as a whole reply (user log 10:48:07/10:48:32). Treat it as chrome.
+  const CHROME_EXACT = /^(thinking completed|deep thinking|analyzing\.\.\.|stop|new chat|scroll to top)[\s.!…]*$/i;
   let lastSentText = "";
 
   function isInsideUserTurn(el) {
@@ -242,80 +245,138 @@ if (!CFG) {
     lastSentText = text.trim();                       // for the echo guard below
     lbLog("INFO", "say: typing into input", { chars: text.length, preview: text.slice(0, 60) });
 
-    // v0.7: bring our tab forward before touching it. Chrome throttles timers
-    // and ignores some pointer/keyboard events on background tabs — this is
-    // why clicking the tab by hand made things "sort of" work. We can't force
-    // activation from a content script (no chrome.tabs permission by design),
-    // so we do the next best thing: focus the document + the input and log
-    // visibility so the debug dump proves whether the tab was hidden.
-    try { window.focus(); } catch {}
-    if (document.hidden) lbLog("WARN", "tab is in BACKGROUND — events may be throttled; click the tab or use Alt+Tab to foreground it", { url: location.href });
+    // v0.8: AUTOMATED TAB SWITCHING. Background tabs are throttled by Chrome
+    // (timers clamped, synthetic key/click handlers ignored by some React
+    // editors) — that's exactly why clicking the tab by hand made things work.
+    // The bridge now asks the service worker to activate ITS OWN tab via
+    // chrome.tabs.update(tabId,{active:true}) before touching the page, and
+    // waits until the tab is actually visible. Zero user interaction.
+    await activateSelf("say");
 
     const el = findInput();
     if (!el) { lbLog("ERROR", "input NOT FOUND", { selector: CFG.input, hint: "site DOM changed — update SITES.input" }); throw new Error("LLM Bridge: input not found"); }
     lbLog("DEBUG", "input located", { tag: el.tagName, ce: el.getAttribute("contenteditable"), cls: String(el.className).slice(0, 60) });
-    el.scrollIntoView({ block: "center" });
-    el.focus({ preventScroll: true });
-    setNativeValue(el, text);
-    await sleep(120 + Math.random() * 120);           // let React register the value
 
     // v0.7: verify the site actually accepted our text before sending. If the
     // box reads back empty, React swallowed our injection — log loudly instead
     // of silently firing Enter at nothing. (v0.7.1: readBox handles both
     // textarea.value and contenteditable.textContent.)
-    if (!readBox(el).trim()) {
-      lbLog("ERROR", "input rejected injected text (box empty after setNativeValue)", { tag: el.tagName, cls: String(el.className).slice(0, 80) });
+    // v0.8 ROBUST SEND SEQUENCE: inject → VERIFY in box → send → VERIFY box
+    // emptied. Each failed verification retries the whole micro-cycle once.
+    // Previously we could fire Enter while React hadn't registered the value
+    // yet ("reply entered but not submitted"), or accept a phantom submit.
+    let submitted = false;
+    for (let attempt = 1; attempt <= 3 && !submitted; attempt++) {
+      el.scrollIntoView({ block: "center" });
+      el.focus({ preventScroll: true });
+      setNativeValue(el, text);
+      await sleep(250 + Math.random() * 150);         // let React register the value
+
+      if (!readBox(el).trim()) {                      // injection rejected — retry
+        lbLog("WARN", `injection attempt ${attempt}: box still empty after setNativeValue`, { tag: el.tagName, cls: String(el.className).slice(0, 80) });
+        continue;
+      }
+
+      // Try every send channel, verifying after each that the box EMPTIED
+      // (emptied box == the site consumed the message).
+      const btn = findSendButton();
+      if (btn) {
+        lbLog("DEBUG", "clicking send button", { label: (btn.getAttribute("aria-label") || btn.textContent || "").trim().slice(0, 30) });
+        dispatchClick(btn);
+        if (await waitBoxEmptied(el, 1500)) { submitted = true; break; }
+        lbLog("DEBUG", "send click didn't empty box — trying next channel");
+      }
+      const form = el.closest("form");
+      if (!submitted && form && typeof form.requestSubmit === "function") {
+        lbLog("DEBUG", "send channel #2: form.requestSubmit()");
+        form.requestSubmit();
+        if (await waitBoxEmptied(el, 1500)) { submitted = true; break; }
+      }
+      if (!submitted) {
+        lbLog("DEBUG", `send channel #3: full Enter sequence (attempt ${attempt})`);
+        pressEnter(el);
+        if (await waitBoxEmptied(el, 2000)) { submitted = true; break; }
+      }
+      if (!submitted && attempt < 3) lbLog("WARN", `message still sitting in box after attempt ${attempt} — re-injecting`);
     }
 
-    // v0.7: send via the most reliable channel available, trying ALL of them:
-    // shadow-DOM-aware button search → form.requestSubmit → full Enter sequence.
-    const btn = findSendButton();
-    let sent = false;
-    if (btn) {
-      lbLog("DEBUG", "clicking send button", { label: (btn.getAttribute("aria-label") || btn.textContent || "").trim().slice(0, 30) });
-      btn.click();
-      sent = true;
-      await sleep(400);
-    }
-    // Confirm the click worked by checking the box emptied; if it didn't, fall
-    // through to requestSubmit / Enter. (Sites that keep text until server ack
-    // would false-negative here, so we still try Enter as a no-op-safe backup.)
-    if (!btn || readBox(el).trim()) {
-      const form = el.closest("form");
-      if (form && typeof form.requestSubmit === "function") {
-        lbLog("DEBUG", "Enter fallback #1: form.requestSubmit()");
-        form.requestSubmit();
-        sent = true;
-        await sleep(400);
-      }
-    }
-    if (readBox(el).trim()) {
-      lbLog("DEBUG", "Enter fallback #2: full key event sequence", { btn: !!btn });
-      pressEnter(el);
-      sent = true;
-      await sleep(500);
-    }
-    // v0.7.1: last resort for contenteditable inputs (qwen uses one in some
-    // builds — `textarea` selector then finds nothing usable or React ignores
-    // the synthetic Enter). If text is STILL sitting in the box, retype it one
-    // character at a time with real input events + a final Enter: this mimics
-    // human typing closely enough that most editors' keydown handlers fire.
-    const stillStuck = readBox(el).trim();
-    if (stillStuck) {
-      lbLog("WARN", "message NOT submitted by button/submit/Enter — trying per-character retype", { remaining: stillStuck.slice(0, 40) });
+    // v0.7.1→v0.8: last resort for stubborn contenteditable inputs (qwen uses
+    // one in some builds). Retype ONE CHARACTER AT A TIME with real input +
+    // keydown events per char, then Enter + button click. This mimics human
+    // typing closely enough that editor keydown handlers fire reliably.
+    if (!submitted && readBox(el).trim()) {
+      lbLog("WARN", "button/submit/Enter all failed — per-character retype (real keystroke simulation)", { remaining: readBox(el).trim().slice(0, 40) });
+      await activateSelf("retype");                   // needs real focus most of all
       try {
         setNativeValue(el, "");
         for (const ch of text) {
-          setNativeValue(el, readBox(el) + ch);
-          await sleep(8 + Math.random() * 12);
+          el.focus({ preventScroll: true });
+          const before = readBox(el);
+          setNativeValue(el, before + ch);
+          el.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: ch }));
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: ch }));
+          await sleep(10 + Math.random() * 14);
         }
-        await sleep(150);
+        await sleep(200);
         pressEnter(el);
-        const b2 = findSendButton();
-        if (b2) b2.click();
+        if (!(await waitBoxEmptied(el, 1500))) {
+          const b2 = findSendButton();
+          if (b2) { dispatchClick(b2); await waitBoxEmptied(el, 1500); }
+        }
+        submitted = !readBox(el).trim();
       } catch (e) { lbLog("ERROR", "retype fallback threw", { err: String(e).slice(0, 120) }); }
     }
-    if (!sent) lbLog("WARN", "no send path executed — reply capture will likely fail");
+    if (!submitted) {
+      lbLog("ERROR", "MESSAGE NOT SUBMITTED — text still sits in the input box after every channel", { preview: readBox(el).trim().slice(0, 60), hidden: document.hidden });
+    } else {
+      lbLog("DEBUG", "message submitted (input box emptied)");
+    }
+  }
+
+  // Poll until the input box empties (= the site consumed the message) or timeout.
+  async function waitBoxEmptied(el, ms) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      if (!readBox(el).trim()) return true;
+      await sleep(120);
+    }
+    return !readBox(el).trim();
+  }
+
+  // v0.8: trusted-ish click: pointer/touch/mouse triple so frameworks that
+  // listen on pointerdown (qwen's send button) react like on a real click.
+  function dispatchClick(node) {
+    const r = node.getBoundingClientRect();
+    const opts = { bubbles: true, cancelable: true, view: window,
+                   clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 };
+    try {
+      node.dispatchEvent(new PointerEvent("pointerdown", { ...opts, pointerId: 1, isPrimary: true }));
+      node.dispatchEvent(new MouseEvent("mousedown", opts));
+      node.dispatchEvent(new PointerEvent("pointerup", { ...opts, pointerId: 1, isPrimary: true }));
+      node.dispatchEvent(new MouseEvent("mouseup", opts));
+      node.dispatchEvent(new MouseEvent("click", opts));
+      node.click();                                   // also the plain path
+    } catch {}
+  }
+
+  // ── v0.8: automated tab activation ────────────────────────────────────────
+  // Ask the service worker to make OUR tab active+focused (chrome.tabs.update
+  // + windows.update), then wait until the page reports itself visible. The
+  // whole swarm therefore cycles through the tabs by itself — no manual
+  // clicking ever. If the SW refuses (shouldn't happen — tabs permission is
+  // declared), we log it loudly and proceed anyway.
+  async function activateSelf(reason) {
+    const res = await new Promise((resolve) => {
+      try { chrome.runtime.sendMessage({ type: "activate-tab", reason }, (r) => resolve(r)); }
+      catch { resolve({ ok: false, error: "sendMessage threw" }); }
+    });
+    if (!res?.ok) { lbLog("WARN", "tab activation refused by background — proceeding anyway", { error: res?.error, reason }); return false; }
+    // Wait for visibilitychange to actually land (a few frames is plenty).
+    const t0 = Date.now();
+    while (document.hidden && Date.now() - t0 < 3000) await sleep(100);
+    lbLog("DEBUG", "tab activated", { reason, visible: !document.hidden, ms: Date.now() - t0 });
+    try { window.focus(); } catch {}
+    return !document.hidden;
   }
 
   // Wait for generation to actually START. Without this you read the PREVIOUS
@@ -395,6 +456,7 @@ if (!CFG) {
 
   function looksLikeChrome(t) {
     // short UI-vocabulary strings ("I prefer this response", "Copy", 👍 labels)
+    if (CHROME_EXACT.test(t.trim())) return true;     // v0.8: "Thinking completed" etc.
     return t.length < 60 && CHROME_HINT.test(t) && !/[.!?…]"']$/.test(t);
   }
   // v0.6 CONFIRM STEP — qwen's "which response do you prefer?" gate leaves a
@@ -404,6 +466,9 @@ if (!CFG) {
   // tells us exactly what label the real UI uses (then extend CFG.confirm).
   async function confirmGate() {
     if (!CFG.confirm) return false;
+    await activateSelf("confirm");                    // v0.8: qwen's preference
+    // gate lives in a real DOM overlay — clicking it while the tab is hidden
+    // was silently dropped, which is why follow-ups needed manual clicks.
     const hits = [];
     (function scan(root, d) {
       if (d > 5) return;
@@ -413,7 +478,7 @@ if (!CFG) {
     const btn = hits.find(b => !b.disabled && b.offsetParent !== null);
     if (btn) {
       lbLog("INFO", "confirm gate: clicking through", { label: (btn.getAttribute("aria-label") || btn.textContent || "").trim().slice(0, 60) });
-      btn.click();
+      dispatchClick(btn);                             // v0.8: full pointer/mouse sequence
       await sleep(400);
       return true;
     }

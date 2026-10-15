@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "LLM Bridge",
+  "version": "0.1.0",
+  "description": "Bridges two authenticated LLM web UIs into a self-driving conversation.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.deepseek.com/*",
+        "https://chat.qwen.ai/*"
+      ],
+      "js": ["bridge.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

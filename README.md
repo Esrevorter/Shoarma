@@ -75,7 +75,8 @@ The extension injects prompts into each page's own input box (React-safe), waits
 | `background.js` | Service worker: spawns the orchestrator via the native launcher, badge = live agent count. |
 | `launcher.py` + `launcher/` | Native messaging host: lets the popup start `orchestrator.py` with your UI settings, logging to `Downloads/shoarma/`. |
 | `hud.css` | Glassmorphic HUD styling, injected as a content-script stylesheet (plus inline fallback). |
-| `orchestrator.py` | The referee. asyncio + websockets router, turn governor, `settings.json` support, per-run timestamped transcripts & logs, CLI flags. |
+| `monitor.html/css/js` | **The live monitor** (v0.4) — a third tab with the full conversation streaming in real time: speaker-colored turns, agent roster, debug-stream toggle, one-click 📋 copy-debug dump. No terminal watching required. |
+| `orchestrator.py` | The referee. asyncio + websockets router, turn governor, `settings.json` support, per-run timestamped transcripts & logs, CLI flags, and an HTTP side-feed (`GET /state`) powering the monitor page. |
 | `scripts/install-launcher.py` | One-time native-host registration (macOS/Linux/Windows). |
 | `scripts/sync-settings.py` | Exports your popup settings from Chrome storage → `settings.json` for CLI runs. |
 | `.github/workflows/build-extension.yml` | CI: validates, packages the extension zip, publishes Releases on `v*` tags. |
@@ -159,6 +160,8 @@ Then watch two AIs argue like it's a sport. The HUD dot tells you who's doing wh
 | 🔴 red | halted or error — press Esc / HALT to stop, reload tab to reset |
 
 The popup badge number = how many agent tabs are alive. If it says `0/2 agent(s) wired`, reload the chat tabs.
+
+**v0.4 — you don't even have to watch the tabs.** Hit **📟 Open live monitor** in the popup: a third tab streams the entire conversation as it happens (speaker-colored turns, per-agent state, timings), with a debug toggle and a one-click **📋 Copy debug** dump for bug reports. The orchestrator runs quietly in the background; its feed stays readable for 60s after the last turn.
 
 ---
 

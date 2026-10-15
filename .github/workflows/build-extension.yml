@@ -31,6 +31,7 @@ jobs:
           node --check bridge.js
           node --check popup.js
           node --check background.js
+          node --check monitor.js
           python -m py_compile orchestrator.py launcher.py scripts/*.py
           echo "✔ all sources valid"
 
@@ -39,6 +40,7 @@ jobs:
           mkdir -p dist
           zip -r "dist/shoarma-extension-v${{ steps.ver.outputs.version }}.zip" \
             manifest.json bridge.js hud.css popup.html popup.css popup.js \
+            monitor.html monitor.css monitor.js \
             background.js orchestrator.py icons/ launcher/ \
             -x "*.DS_Store"
           unzip -l "dist/shoarma-extension-v${{ steps.ver.outputs.version }}.zip"

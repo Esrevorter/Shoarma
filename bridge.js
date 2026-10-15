@@ -329,6 +329,34 @@ if (!CFG) {
   const CHROME_EXACT = /^(thinking completed|deep thinking|analyzing\.\.\.|stop|new chat|scroll to top)[\s.!…]*$/i;
   let lastSentText = "";
   let lastCapturedNorm = "";                          // v0.8.3: stale-reply guard
+  const norm = (s) => String(s).replace(/\s+/g, " ").trim().toLowerCase();
+  // v0.9.4: ghost-send guard. The user log of 2026-10-15 19:33 shows the exact
+  // failure this fixes: DeepSeek accepted our message but its React state
+  // cleared the box a beat LATER than our 1.5–2 s wait windows. The bridge
+  // declared "MESSAGE NOT SUBMITTED" and threw — while the site had in fact
+  // started generating (the reply appeared at 19:33:32 with exactly our text
+  // as its prompt). The engine then treated the throw as a send failure,
+  // re-injected the SAME text into the live composer and burned the whole
+  // 180 s reply timeout. So: whenever every send channel appears to fail,
+  // check whether the site actually consumed the message anyway (our text is
+  // visible inside an assistant/user bubble, or a new bubble appeared) before
+  // declaring failure.
+  function detectGhostSend(el, text, baseline) {
+    try {
+      const now = readBox(el);
+      if (!now.trim() || norm(now) === norm(text)) return false;   // box empty ⇒ normal success path
+    } catch { return false; }
+    const probe = norm(text).slice(0, 80);
+    if (probe.length < 20) return false;               // too short to prove anything
+    const nodes = assistantNodes();
+    for (let i = Math.max(0, baseline - 2); i < nodes.length; i++) {
+      try {
+        const t = norm(nodes[i].innerText ?? nodes[i].textContent ?? "");
+        if (t && t.includes(probe)) return true;       // our text surfaced in the transcript
+      } catch {}
+    }
+    return false;
+  }
 
   function isInsideUserTurn(el) {
     for (let n = el, d = 0; n && d < 12; n = n.parentElement, d++) {
@@ -364,8 +392,9 @@ if (!CFG) {
     return all.filter(n => !all.some(m => m !== n && m.contains(n)));
   }
 
-  async function say(text) {
+  async function say(text, opts = {}) {
     lastSentText = text.trim();                       // for the echo guard below
+    const baseline = Number.isInteger(opts.baseline) ? opts.baseline : -1;  // v0.9.4 ghost-send check
     lbLog("INFO", "say: typing into input", { chars: text.length, preview: text.slice(0, 60) });
 
     // v0.8: AUTOMATED TAB SWITCHING. Background tabs are throttled by Chrome
@@ -477,8 +506,37 @@ if (!CFG) {
         submitted = !readBox(el).trim();
       } catch (e) { lbLog("ERROR", "retype fallback threw", { err: String(e).slice(0, 120) }); }
     }
+    // v0.9.4: ghost-send check — before declaring failure, give the site one
+    // extra beat to empty the box (DeepSeek cleared it ~60 s late in the user
+    // log) and verify whether the message was actually consumed anyway. Only
+    // then do we flush the stuck text and report a real failure.
     if (!submitted) {
-      lbLog("ERROR", "MESSAGE NOT SUBMITTED — text still sits in the input box after every channel", { preview: readBox(el).trim().slice(0, 60), hidden: document.hidden });
+      lbLog("WARN", "all send channels exhausted — final settle check before declaring failure",
+            { remainingChars: readBox(el).trim().length, hidden: document.hidden });
+      await sleep(3000);
+      if (!readBox(el).trim()) { submitted = true; }
+      else if (detectGhostSend(el, text, baseline)) {
+        lbLog("WARN", "GHOST SEND detected — box still shows text but the site already consumed the message (treating as submitted)",
+              { preview: readBox(el).trim().slice(0, 60) });
+        try {                                          // flush the stale DOM text so React state matches an empty composer
+          setNativeValue(el, "");
+          if (isCE(el)) { try { document.execCommand("selectAll"); document.execCommand("delete"); } catch {} }
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
+        } catch {}
+        submitted = true;
+      }
+    }
+    if (!submitted) {
+      // v0.9.4: the message truly did not go out. Flush the editor NOW —
+      // leaving 1.8k chars sitting in the composer made every later retry and
+      // the next turn's injection fight a jammed box (the 19:33–19:36 spiral).
+      try {
+        setNativeValue(el, "");
+        if (isCE(el)) { try { document.execCommand("selectAll"); document.execCommand("delete"); } catch {} }
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
+        lbLog("INFO", "failed message flushed from input box (editor reset for retry)");
+      } catch {}
+      lbLog("ERROR", "MESSAGE NOT SUBMITTED — text still sits in the input box after every channel", { preview: text.trim().slice(0, 60), hidden: document.hidden });
       // v0.9: tell the orchestrator/engine explicitly so it can cool down and
       // re-dispatch instead of us throwing a generic error mid-turn.
       try { transport?.send({ type: "send_failed", agent: CFG.name, preview: readBox(el).trim().slice(0, 80) }); } catch {}
@@ -619,7 +677,7 @@ if (!CFG) {
     return text;
   }
 
-  const norm = (s) => String(s).replace(/\s+/g, " ").trim().toLowerCase();
+  // (v0.9.4: `norm` moved up next to the ghost-send guard — single definition)
 
   function looksLikeChrome(t) {
     // short UI-vocabulary strings ("I prefer this response", "Copy", 👍 labels)
@@ -803,7 +861,7 @@ if (!CFG) {
     try {
       for (;;) {
         const baseline = assistantNodes().length;      // bubble count BEFORE send
-        await say(textToSay);
+        await say(textToSay, { baseline });            // v0.9.4: say can now detect a ghost send
         hud("thinking…");
         await waitForStart(15000, baseline);           // stop button OR new bubble
         await waitForIdle();
@@ -820,7 +878,12 @@ if (!CFG) {
     } catch (e) {
       lbLog("ERROR", "turn FAILED", { error: String(e), stack: String(e.stack).split("\n").slice(0, 3).join(" | ") });
       hud("error");
-      transport?.send({ type: "error", agent: CFG.name, text: String(e) });
+      // v0.9.4: if we actually captured a real reply before throwing (late
+      // generation after a ghost-send / timeout), ship it as captured:true so
+      // the swarm engine ADOPTS the turn instead of treating it as a failure
+      // and re-injecting into a live composer (user log 19:33→19:36 spiral).
+      const lateReply = textP && textP !== "(no response captured)" ? textP : null;
+      try { transport?.send({ type: "error", agent: CFG.name, text: lateReply || String(e), ...(lateReply ? { captured: true } : {}) }); } catch {}
     } finally {
       busy = false;
       if (pendingSay && !state.halted) {               // drain queued say after failure/idle capture

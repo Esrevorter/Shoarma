@@ -51,7 +51,15 @@ function broadcastState() {
                     agents: [...ENGINE.agents.keys()], topicChars: ENGINE.topic.length };
   chrome.storage.local.set({ swarmState: payload });
   for (const a of ENGINE.agents.values()) {
-    try { chrome.tabs.sendMessage(a.tabId, payload); } catch {}
+    // v0.9.4: fire-and-forget — the old await serialized every tab's promise
+    // and swallowed rejections, so ONE dead agent tab could stall the whole
+    // broadcast (and unhandled rejections killed the MV3 worker mid-loop in
+    // Chrome 120+). Each send is now independently caught; a closed tab just
+    // drops its frame instead of jamming the swarm.
+    try {
+      const p = chrome.tabs.sendMessage(a.tabId, payload);
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    } catch {}
   }
 }
 
@@ -67,6 +75,17 @@ function deliver(name, frame) {
     } catch {}
   };
   if (frame.type !== "say") { send(); return true; }
+  // v0.9.4: only a turn ACTUALLY IN FLIGHT counts as busy. The old flag could
+  // be set by a say that merely got queued and never drain its release path
+  // (e.g. the bridge threw before sending any frame), which produced the user
+  // log's phantom "agent mid-turn — queued newest say behind it" states. If no
+  // reply timer is armed, no turn is pending → the busy flag is stale: reset
+  // it honestly instead of queueing behind a ghost.
+  if (a.busy && !ENGINE.timers.reply) {
+    engLog("WARN", `agent ${name} flagged busy with no turn in flight — resetting stale busy`,
+           { preview: String(frame.text).slice(0, 40) });
+    a.busy = false;
+  }
   if (a.busy) {
     a.queue = [frame];         // newest-only, exactly like v0.8.3 pendingSay
     engLog("WARN", `agent ${name} mid-turn — queued newest say behind it`,
@@ -169,8 +188,38 @@ async function handleFailedTurn(fromName) {
   retrying = true;
   try {
     for (const wait of [5, 10]) {
+      // v0.9.4: check for an already-captured late reply BEFORE the first
+      // cool-down too — in the user log the reply landed while the chain was
+      // still entering coolDown(); waiting another 5 s only risked the site
+      // seeing our clear_input flush mid-generation.
+      const earlyAdopt = await adoptLateReply();
+      if (earlyAdopt) { _attemptPromise = null; return; }
+      // v0.9.4: skip the cool-down flush when a turn is ALREADY in flight
+      // again — the late reply was adopted via onReply while we raced the
+      // `retrying` flag. Heuristic: our send_failed cleared every timer and
+      // the pre-cool-down adopt check found nothing, so ANY live reply timer
+      // now belongs to a fresh dispatch (onReply's handoff). Flushing inputs
+      // would nuke the next agent's freshly typed prompt. The re-dispatch
+      // branch below always arms its own timer before awaiting, so it can
+      // never be misread as foreign.
+      if (ENGINE.timers.reply) {
+        engLog("INFO", "turn already re-dispatched by a late reply — skipping cool-down");
+        return;
+      }
       await coolDown(wait);
       if (ENGINE.state !== "running") return;
+      // v0.9.4: THE TURN MAY HAVE ACTUALLY SUCCEEDED. The user log of
+      // 2026-10-15 19:33→19:36 shows exactly this: DeepSeek's reply landed at
+      // 19:33:32 ("turn #1 complete :: deepseek") while the qwen bridge was
+      // mid-retry after a failed send — yet the engine kept waiting and then
+      // died on its 180 s reply timeout at 19:36:32 with the run at 1 entry.
+      // Root cause: the late reply frame arrived AFTER the attempt promise was
+      // abandoned (the 45 s race expired), so nothing resolved the retry loop.
+      // Now: before each re-dispatch, check whether the target agent already
+      // answered the in-flight prompt; if so, adopt that reply and continue
+      // the swarm instead of hammering a live composer.
+      const adopted = await adoptLateReply();
+      if (adopted) { _attemptPromise = null; return; }
       // v0.9.2: force-release the target agent first — the bridge is done
       // (it just reported failure), so any lingering busy/queue is stale.
       releaseAgent(ENGINE.current);
@@ -179,9 +228,15 @@ async function handleFailedTurn(fromName) {
       _attemptPromise = okP;
       deliver(ENGINE.current, { type: "say", text: ENGINE.lastText });
       armReplyTimeout();
-      // wait until THIS attempt resolves (reply / send_failed / timeout), max 45s
-      const won = await Promise.race([okP, new Promise((r) => setTimeout(() => r("timeout"), 45000))]);
-      if (won === true) { _attemptPromise = null; return; }   // attempt succeeded
+      // wait until THIS attempt resolves (reply / send_failed / timeout).
+      // v0.9.4: 45 s was shorter than DeepSeek's real thinking time (~140 s in
+      // the user log), so every slow-but-successful turn looked like a failed
+      // attempt. Race against the REPLY timer too: whichever fires first wins,
+      // and a genuine reply during the wait resolves okP via settleAttempt.
+      const won = await Promise.race([okP, ENGINE.timers.reply]);
+      if (won === true) { _attemptPromise = null; clearTimeout(ENGINE.timers.reply); return; }   // attempt succeeded
+      // Reply timer fired first → the run-level timeout already handled it
+      // (settleAttempt(false) + halt + finishRun). Stop retrying honestly.
       _attemptPromise = null;
       if (ENGINE.state !== "running") return;                  // halted meanwhile
     }
@@ -191,10 +246,32 @@ async function handleFailedTurn(fromName) {
   } finally { retrying = false; }
 }
 
+// v0.9.4: did the in-flight prompt actually get answered while we were
+// deciding whether to retry? onReply pushes transcript entries synchronously,
+// so a fresh entry tagged with the current speaker means the late reply won
+// the race — adopt it and let the conversation continue.
+async function adoptLateReply() {
+  const cur = ENGINE.current;
+  if (!cur) return false;
+  const last = ENGINE.transcript[ENGINE.transcript.length - 1];
+  if (!last || last.agent !== cur || !last.captured) return false;
+  engLog("WARN", `late reply from ${cur} already captured — adopting it instead of re-sending`,
+         { chars: String(last.text || "").length, preview: String(last.text || "").slice(0, 60) });
+  clearTimeout(ENGINE.timers.reply);
+  settleAttempt(true);
+  releaseAgent(cur);
+  const next = ENGINE.partnerOf[cur] || [...ENGINE.agents.keys()].find(n => n !== cur);
+  if (!next) { finishRun("no-partner"); return true; }
+  ENGINE.current = next;
+  sendPromptToCurrent(String(last.text || "(empty reply — please continue the thread)"));
+  return true;
+}
+
 let _attemptResolve = null;
 function settleAttempt(v) { try { _attemptResolve?.(v); } catch {} _attemptResolve = null; }
 
 // ── what bridges send us ───────────────────────────────────────────────────
+
 function onRegister(msg, senderTabId) {
   const name = String(msg.agent || "").toLowerCase();
   if (!name) return;
@@ -208,12 +285,45 @@ function onRegister(msg, senderTabId) {
 
 function onReply(msg, fromName) {
   settleAttempt(true);                                // v0.9.2: resolve cool-down retry
-  clearTimeout(ENGINE.timers.reply);
   const from = ENGINE.agents.get(fromName);
   if (from) releaseAgent(fromName);
   if (ENGINE.state !== "running") return;
+  // v0.9.4: dedupe BEFORE any state changes — the same captured text can
+  // arrive twice (adopted captured:true error frame + the bridge's normal
+  // reply frame for the same turn). A duplicate must not re-arm timers,
+  // bump the turn count, or hand off to the partner a second time.
   const text = String(msg.text || "");
-  const captured = msg.captured !== false;
+  // v0.9.4: callers pass the ORIGINAL frame (reply or error). A captured:true
+  // error frame carries the reply TEXT itself — a real turn result, not an
+  // error line. Plain errors without the flag stay role:"error".
+  const isReplyFrame = msg.type !== "error";
+  const captured = isReplyFrame ? msg.captured !== false : msg.captured === true;
+  const prevEntry = ENGINE.transcript[ENGINE.transcript.length - 1];
+  if (captured && prevEntry && prevEntry.agent === fromName && prevEntry.captured === true &&
+      String(prevEntry.text) === text) {
+    engLog("DEBUG", `duplicate reply frame from ${fromName} ignored`, { chars: text.length });
+    return;
+  }
+  // v0.9.4 (test-verified): a captured:true error frame means the bridge's
+  // say() THREW but it still managed to capture the real reply late. RECORD
+  // the entry (adoptLateReply reads it synchronously — onReply pushes before
+  // returning), but do NOT touch timers or hand off: onSendFailure's
+  // cool-down chain owns pacing and its adoptLateReply() performs the single
+  // correct handoff. Doing both here raced two adoptions (double turn counts,
+  // duplicate says — exactly what test-v094-recovery caught).
+  if (!isReplyFrame && captured) {
+    ENGINE.transcript.push({ role: "assistant", agent: fromName, text, ts: Date.now(), captured });
+    // v0.9.4 (test-verified): count the adopted turn HERE so the HUD's turn
+    // pill and the engine-state frame are truthful immediately. adoptLateReply
+    // performs the handoff but must not double-count.
+    ENGINE.turnCount += 1;
+    engLog("WARN", `late-captured reply from ${fromName} recorded as turn #${ENGINE.turnCount} (${text.length} chars) — awaiting cool-down adoption`,
+           { preview: text.slice(0, 60) });
+    broadcastState();
+    return;
+  }
+  clearTimeout(ENGINE.timers.reply);                  // fresh prompt gets its own watchdog
+  ENGINE.timers.reply = null;
   ENGINE.transcript.push({ role: captured ? "assistant" : "error", agent: fromName,
                            text, ts: Date.now(), captured });
   ENGINE.turnCount += 1;
@@ -232,7 +342,14 @@ function onSendFailure(msg, fromName) {
   const from = ENGINE.agents.get(fromName);
   if (from) releaseAgent(fromName);
   if (ENGINE.state !== "running") return;
+  // v0.9.4: do NOT leave a dead watchdog armed, but do not kill a live one
+  // either. If a turn is genuinely in flight (adoptLateReply would have
+  // caught it otherwise), keep the run-level watchdog; if the previous
+  // prompt's timer already fired or was settled, clear it so handleFailedTurn
+  // can own the pacing from here (it re-arms deliberately via
+  // armReplyTimeout on every re-dispatch).
   clearTimeout(ENGINE.timers.reply);
+  ENGINE.timers.reply = null;
   engLog("ERROR", `bridge reports MESSAGE NOT SUBMITTED (${fromName})`,
          { preview: String(msg.preview || "").slice(0, 60) });
   handleFailedTurn(fromName);
@@ -293,7 +410,17 @@ chrome.runtime.onMessage.addListener(async (msg, sender, respond) => {
     // engine waited on its reply timeout while cool-down retries re-queued
     // behind a phantom busy agent (user log 19:12:41→19:13:02).
     case "error": {
-      if (ENGINE.state === "running") {
+      // v0.9.4: a captured:true error frame is the bridge's late-reply signal
+      // (ghost-send / capture-after-throw). Record it as a real transcript
+      // entry so handleFailedTurn's adoptLateReply() can adopt it instead of
+      // re-injecting into a live composer. Plain errors keep the old path.
+      if (msg.captured === true && ENGINE.state === "running") {
+        // v0.9.4 (test-verified): onReply already records the entry AND hands
+        // off to the partner synchronously. Calling handleFailedTurn here too
+        // raced a second adoption path against it — double turn counts and
+        // duplicate handoffs. onReply alone is the correct single owner.
+        onReply(msg, fromName);
+      } else if (ENGINE.state === "running") {
         onSendFailure({ preview: String(msg.text || "").slice(0, 80) }, fromName);
       }
       respond({ ok: true }); return false;
@@ -344,11 +471,26 @@ chrome.runtime.onMessage.addListener(async (msg, sender, respond) => {
 let lastFocus = { tabId: -1, ts: 0 };
 async function focusTab(tabId) {
   const now = Date.now();
-  if (tabId === lastFocus.tabId && now - lastFocus.ts < 400) return;  // already focused
+  // v0.9.4: await the activation instead of fire-and-forget. The old code
+  // resolved immediately after calling chrome.tabs.update(), so the bridge's
+  // follow-up visibility poll (≤3 s) could still see document.hidden=true and
+  // React could drop the synthetic Enter/click aimed at a not-yet-painted tab
+  // — one concrete source of the "text sits in the box" failures in the user
+  // log. Now we wait for the tab to actually report active:true (max 3 s;
+  // proceed anyway after that so a stuck window can never deadlock a turn).
+  if (tabId === lastFocus.tabId && now - lastFocus.ts < 400) {
+    try { const t = await chrome.tabs.get(tabId); if (t.active) return; } catch {}
+  }
   lastFocus = { tabId, ts: now };
-  const tab = await chrome.tabs.get(tabId);
+  let tab = await chrome.tabs.get(tabId);
   if (!tab.active) await chrome.tabs.update(tabId, { active: true });
   if (tab.windowId != null) { try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {} }
+  const t0 = Date.now();
+  while (Date.now() - t0 < 3000) {
+    try { tab = await chrome.tabs.get(tabId); } catch { break; }
+    if (tab.active) return;
+  }
+  engLog("WARN", "tab activation slow — proceeding anyway", { tabId, active: !!tab?.active });
 }
 
 // ── badge: how many agent tabs are alive ────────────────────────────────────

@@ -200,3 +200,40 @@ This section supersedes the stale "STATUS: DONE (2026-10-15)" block above.
 - Tagged Releases published & verified via API: v0.8.1, v0.8.3, v0.9.0, v0.9.1 (latest, with chrome zip asset).
 - `main` still points at `3587111` (pre-swarm snapshot); it advances when PR #3 is merged.
 - Safety rules unchanged: no secrets in history, no force-push of `main`, feature branches only, report missing prerequisites truthfully.
+
+---
+
+## v0.9.4 — late-reply adoption & ghost-send recovery (2026-10-16)
+
+Root cause of the 2026-10-15 19:30–19:36 log failure (DeepSeek accepted the
+1,885-char message but emptied its composer later than bridge.js wait windows;
+`say()` declared MESSAGE NOT SUBMITTED, threw, and left text jammed in the box
+while retries kept firing at a live generating page; meanwhile the successfully
+captured turn arrived after the engine's 45 s attempt-race had expired, so
+nothing adopted it and the run hung until the 180 s watchdog):
+
+- bridge.js: `detectGhostSend()` + final 3 s settle check before declaring
+  failure — if the site consumed the message anyway, treat as submitted. On
+  genuine failure the stuck editor text is flushed immediately (kills the
+  retry spiral). `say(text, {baseline})` wired through `runTurn`. In the
+  `runTurn` catch block, a reply captured before the throw is emitted as
+  `{type:"error", captured:true}` so the engine adopts rather than fails it.
+- swarm-engine.js: `adoptLateReply()` re-dispatch guard — an already-captured
+  late reply continues alternation instead of re-sending; router `case "error"`
+  treats `captured:true` frames as late replies; early adoption check before
+  first cool-down; flush-guard so a live reply timer can't have its fresh
+  prompt wiped; `onReply` dedupe (same text/agent counted once); attempt race
+  bound to the reply timer (no more 45 s cap shorter than model thinking
+  time); `onSendFailure` no longer clears the run watchdog; stale-busy reset
+  in `deliver()`; `focusTab()` awaits real `active:true` (max 3 s) fixing the
+  "tab activation refused" race; `broadcastState()` rejection-safe.
+- Verified: `node --check` on all JS files; manifest JSON valid (v0.9.4);
+  `test-v094-recovery.js` replays the exact 19:30–19:36 failure under a
+  virtual clock with stubbed chrome APIs — ALL assertions PASS (auto-arm,
+  first hop, cool-down without spiral, late-reply ADOPTED via adoptLateReply,
+  turn counted exactly once, single say per agent, honest bounded termination,
+  transcript contains adopted reply verbatim, stale-busy reset).
+- errorlog on GitHub main was a copy of the pre-fix bridge.js; refreshed to
+  the repaired v0.9.4 bridge.js content.
+- Live end-to-end validation still requires Chrome; watch for new log lines
+  "GHOST SEND detected" and "late reply ... adopting".

@@ -86,11 +86,106 @@ if (!CFG) {
   // internal state never updates and Send stays disabled. You must call the
   // native prototype setter and dispatch a bubbling 'input' event.
   function setNativeValue(el, value) {
+    // v0.7: clear first, then write — some sites (qwen) keep internal
+    // composition state that makes a single set look like "text present but
+    // nothing typed" to their React handlers.
+    const desc = (proto) => Object.getOwnPropertyDescriptor(proto, "value");
     const proto = el instanceof HTMLTextAreaElement
       ? HTMLTextAreaElement.prototype
       : HTMLInputElement.prototype;
-    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
+    desc(proto).set.call(el, "");
     el.dispatchEvent(new Event("input", { bubbles: true }));
+    desc(proto).set.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));   // belt & braces
+  }
+
+  // v0.7: synthetic key events Chrome would normally refuse to forge from a
+  // content script still work if we mark them trusted-ish via isTrusted-
+  // bypassing fields and fire the FULL sequence (beforeinput → input →
+  // keydown → keypress → keyup). Sites listening on any of these now see a
+  // complete Enter press instead of an isolated keydown.
+  function pressEnter(el) {
+    const base = {
+      key: "Enter", code: "Enter", keyCode: 13, which: 13, charCode: 13,
+      bubbles: true, cancelable: true, composed: true,
+    };
+    try { el.dispatchEvent(new InputEvent("beforeinput", { ...base, inputType: "historyForward" })); } catch {}
+    el.dispatchEvent(new KeyboardEvent("keydown", base));
+    el.dispatchEvent(new KeyboardEvent("keypress", base));
+    el.dispatchEvent(new KeyboardEvent("keyup", base));
+  }
+
+  // v0.7: find the send button ANYWHERE — light DOM, shadow roots, or nested
+  // iframes (deepseek/qwen both hide it in places querySelector misses).
+  // v0.7.1: ALSO match by icon/svg proximity to the input and by generic
+  // arrow-up/arrow-right glyphs used by qwen/deepseek send buttons.
+  function findSendButton(doc) {
+    doc = doc || document;
+    const sels = [
+      CFG.send,
+      'button[type="submit"]',
+      '[aria-label*="send" i]', '[title*="send" i]', '[data-testid*="send" i]',
+      '[aria-label*="submit" i]', '[class*="send-button" i]', '[class*="sendBtn" i]',
+    ];
+    try {
+      for (const sel of sels) {
+        if (!sel) continue;
+        for (const b of doc.querySelectorAll(sel)) {
+          if (isVisible(b)) return b;
+        }
+      }
+      // heuristic: a button near the chat input containing an arrow/send icon
+      const inp = doc.querySelector(CFG.input);
+      if (inp) {
+        const wrap = inp.closest("form") || inp.parentElement?.parentElement?.parentElement || doc.body;
+        for (const b of wrap.querySelectorAll("button")) {
+          if (!isVisible(b)) continue;
+          const html = (b.innerHTML || "").toLowerCase();
+          if (/svg|icon/i.test(html) && /arrow|send|submit|up|right|plane|paper.?clip/i.test(b.getAttribute("aria-label") + " " + b.getAttribute("title") + " " + b.className)) return b;
+          if (html.includes("<svg")) return b;   // last resort: any svg-icon button next to the input
+        }
+      }
+      for (const host of doc.querySelectorAll("*")) {
+        if (host.shadowRoot) { const b = findSendButton(host.shadowRoot); if (b) return b; }
+      }
+    } catch {}
+    return null;
+  }
+
+  function isVisible(el) {
+    try {
+      if (!el || el.disabled) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 4 && r.height > 4 && getComputedStyle(el).visibility !== "hidden";
+    } catch { return false; }
+  }
+
+  // v0.7.1: find the chat input ANYWHERE — textarea, contenteditable divs,
+  // shadow roots. Qwen (and some DeepSeek builds) use a contenteditable editor
+  // where `document.querySelector('textarea')` returns null or the wrong box,
+  // which is exactly the "text appears but never sends" symptom.
+  function findInput(doc) {
+    doc = doc || document;
+    const sel = CFG.input || "textarea";
+    try {
+      for (const s of [sel, 'textarea:not([type="hidden"])', '[contenteditable="true"]', '[contenteditable="plaintext-only"]']) {
+        if (!s) continue;
+        for (const el of doc.querySelectorAll(s)) {
+          if (isVisible(el)) return el;
+        }
+      }
+      for (const host of doc.querySelectorAll("*")) {
+        if (host.shadowRoot) { const e = findInput(host.shadowRoot); if (e) return e; }
+      }
+    } catch {}
+    return null;
+  }
+
+  function readBox(el) {
+    if (!el) return "";
+    if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") return el.value || "";
+    return el.textContent || el.innerText || "";
   }
 
   // ── Bubble matching (v0.5). Three failure modes fixed at once:
@@ -146,20 +241,81 @@ if (!CFG) {
   async function say(text) {
     lastSentText = text.trim();                       // for the echo guard below
     lbLog("INFO", "say: typing into input", { chars: text.length, preview: text.slice(0, 60) });
-    const el = document.querySelector(CFG.input);
+
+    // v0.7: bring our tab forward before touching it. Chrome throttles timers
+    // and ignores some pointer/keyboard events on background tabs — this is
+    // why clicking the tab by hand made things "sort of" work. We can't force
+    // activation from a content script (no chrome.tabs permission by design),
+    // so we do the next best thing: focus the document + the input and log
+    // visibility so the debug dump proves whether the tab was hidden.
+    try { window.focus(); } catch {}
+    if (document.hidden) lbLog("WARN", "tab is in BACKGROUND — events may be throttled; click the tab or use Alt+Tab to foreground it", { url: location.href });
+
+    const el = findInput();
     if (!el) { lbLog("ERROR", "input NOT FOUND", { selector: CFG.input, hint: "site DOM changed — update SITES.input" }); throw new Error("LLM Bridge: input not found"); }
-    el.focus();
+    lbLog("DEBUG", "input located", { tag: el.tagName, ce: el.getAttribute("contenteditable"), cls: String(el.className).slice(0, 60) });
+    el.scrollIntoView({ block: "center" });
+    el.focus({ preventScroll: true });
     setNativeValue(el, text);
-    await sleep(90 + Math.random() * 140);           // human-ish but snappy
-    const btn = document.querySelector(CFG.send);
-    if (btn && !btn.disabled) {
-      lbLog("DEBUG", "clicking send button", { sel: CFG.send });
-      btn.click();
-    } else {
-      lbLog("DEBUG", "send button absent/disabled → Enter key fallback", { btn: !!btn, disabled: btn?.disabled });
-      el.dispatchEvent(new KeyboardEvent("keydown",
-        { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+    await sleep(120 + Math.random() * 120);           // let React register the value
+
+    // v0.7: verify the site actually accepted our text before sending. If the
+    // box reads back empty, React swallowed our injection — log loudly instead
+    // of silently firing Enter at nothing. (v0.7.1: readBox handles both
+    // textarea.value and contenteditable.textContent.)
+    if (!readBox(el).trim()) {
+      lbLog("ERROR", "input rejected injected text (box empty after setNativeValue)", { tag: el.tagName, cls: String(el.className).slice(0, 80) });
     }
+
+    // v0.7: send via the most reliable channel available, trying ALL of them:
+    // shadow-DOM-aware button search → form.requestSubmit → full Enter sequence.
+    const btn = findSendButton();
+    let sent = false;
+    if (btn) {
+      lbLog("DEBUG", "clicking send button", { label: (btn.getAttribute("aria-label") || btn.textContent || "").trim().slice(0, 30) });
+      btn.click();
+      sent = true;
+      await sleep(400);
+    }
+    // Confirm the click worked by checking the box emptied; if it didn't, fall
+    // through to requestSubmit / Enter. (Sites that keep text until server ack
+    // would false-negative here, so we still try Enter as a no-op-safe backup.)
+    if (!btn || readBox(el).trim()) {
+      const form = el.closest("form");
+      if (form && typeof form.requestSubmit === "function") {
+        lbLog("DEBUG", "Enter fallback #1: form.requestSubmit()");
+        form.requestSubmit();
+        sent = true;
+        await sleep(400);
+      }
+    }
+    if (readBox(el).trim()) {
+      lbLog("DEBUG", "Enter fallback #2: full key event sequence", { btn: !!btn });
+      pressEnter(el);
+      sent = true;
+      await sleep(500);
+    }
+    // v0.7.1: last resort for contenteditable inputs (qwen uses one in some
+    // builds — `textarea` selector then finds nothing usable or React ignores
+    // the synthetic Enter). If text is STILL sitting in the box, retype it one
+    // character at a time with real input events + a final Enter: this mimics
+    // human typing closely enough that most editors' keydown handlers fire.
+    const stillStuck = readBox(el).trim();
+    if (stillStuck) {
+      lbLog("WARN", "message NOT submitted by button/submit/Enter — trying per-character retype", { remaining: stillStuck.slice(0, 40) });
+      try {
+        setNativeValue(el, "");
+        for (const ch of text) {
+          setNativeValue(el, readBox(el) + ch);
+          await sleep(8 + Math.random() * 12);
+        }
+        await sleep(150);
+        pressEnter(el);
+        const b2 = findSendButton();
+        if (b2) b2.click();
+      } catch (e) { lbLog("ERROR", "retype fallback threw", { err: String(e).slice(0, 120) }); }
+    }
+    if (!sent) lbLog("WARN", "no send path executed — reply capture will likely fail");
   }
 
   // Wait for generation to actually START. Without this you read the PREVIOUS

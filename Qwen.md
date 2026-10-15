@@ -297,3 +297,21 @@ Fixes:
     so a missing action API can never throw mid-message and kill the worker.
 Verification: recovery test suite green; build validator now enforces non-empty
 service_worker referencing a real file (so this regression cannot ship again).
+
+## v0.9.7 — live re-verification of v0.9.6 release + clean rebuild (2026-10-16)
+User report: "I did not find the new release (verified on Github)."
+Live API verification (curl + PAT, repo Esrevorter/Shoarma):
+  • GET /releases → v0.9.6 EXISTS, published 2026-10-15T20:09:29Z, NOT draft,
+    asset shoarma-v0.9.6-chrome.zip uploaded by github-actions[bot].
+  • Tag v0.9.6 → commit 422281b == remote main HEAD. Release is real and current.
+  Repo verified PUBLIC via API (private=false), so anonymous access works — the
+  "not found" was most likely a stale browser view, or checking Tags/Actions
+  instead of https://github.com/Esrevorter/Shoarma/releases.
+Hardening shipped in v0.9.7 (no functional extension changes):
+  • .gitignore now excludes errorlog and run-*.log; both removed from git index
+    (they were committed debug captures, still present as local untracked files).
+  • Version bump 0.9.6 → 0.9.7 to trigger CI build_extension.yml → tag v0.9.7 →
+    fresh release + zip attached by Actions (independent re-publish path).
+Verification this session: node --check ×4 JS, py_compile all Python, recovery
+test suite ALL PASSED, tools/build_release.py BUILT
+shoarma-v0.9.7-chrome.zip (13 entries, sha256=a2b07e084dcd0352bc822051387ddd0442b5ade24383b7d1efd5e2f61a27939c).

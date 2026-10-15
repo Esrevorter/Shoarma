@@ -1,3 +1,7 @@
 .env
 # build artifacts (released via GitHub Releases, not committed)
 dist/
+# captured debug logs — never part of the extension build
+errorlog
+run-*.log
+__pycache__/

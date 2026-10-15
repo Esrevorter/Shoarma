@@ -119,10 +119,28 @@ async function refreshBridgeTabs() {
 refreshBridgeTabs(); setInterval(refreshBridgeTabs, 5000);
 
 const seenEngineSeq = new Set();           // dedupe engine lines mirrored to tabs
+let lastSwarmTs = 0;                       // v0.9.9: don't re-render the same broadcast every poll
+// v0.9.9 BUGFIX ("debug dump was just a header line"): pollEngine only asked
+// BRIDGE TABS for their log mirrors. With zero registered agents — or when the
+// engine's sendMessage fan-out finds no listeners — nothing reached DEBUG_LINES
+// and Copy debug produced only the header. The engine always mirrors its own
+// ring into local.debugRing, so read it there too (deduped via seenEngineSeq).
+async function drainEngineRing() {
+  const { debugRing } = await chrome.storage.local.get({ debugRing: [] });
+  if (!Array.isArray(debugRing)) return;
+  for (const e of debugRing.slice(-300)) {
+    const key = `${e.ts}|${e.agent}|${e.msg}`;
+    if (seenEngineSeq.has(key)) continue;
+    seenEngineSeq.add(key);
+    renderEvent({ type: "log", agent: e.agent || "engine", level: e.level, msg: e.msg,
+                  data: e.data, ts: new Date(e.ts || Date.now()).toLocaleTimeString() });
+  }
+}
 async function pollEngine() {
   const { swarmState } = await chrome.storage.local.get({ swarmState: null });
   if (!swarmState) return false;           // engine never ran → remote discovery next
   setPill(true, "live · in-browser engine");
+  await drainEngineRing();
   // roster: ask each bridge for its state + engine-log mirror
   const agents = {};
   for (const tab of bridgeTabs) {
@@ -132,12 +150,19 @@ async function pollEngine() {
       agents[name] = { state: st.state, turns: st.turns };
       for (const l of (st.log || [])) {
         if (l.agent !== "engine") continue;
-        const key = `${l.ts}|${l.msg}`;
+        const key = `${l.ts}|${l.agent || "engine"}|${l.msg}`;
         if (seenEngineSeq.has(key)) continue;
         seenEngineSeq.add(key);
         renderEvent({ type: "log", agent: "engine", level: l.level, msg: l.msg, data: l.data, ts: l.ts });
       }
     } catch {}
+  }
+  // v0.9.9: system line per phase change (was rendered on EVERY 800ms poll —
+  // hundreds of duplicates flooded the feed and the copy buffer)
+  if (swarmState.state && swarmState.ts > lastSwarmTs) {
+    lastSwarmTs = swarmState.ts;
+    renderEvent({ type: "log", agent: "engine", level: "INFO",
+                  msg: `state → ${swarmState.state} · turn ${swarmState.turn ?? 0}/${swarmState.turns ?? "?"} · agents: ${(swarmState.agents || []).join(", ") || "none"}` });
   }
   if (Object.keys(agents).length) renderAgents(agents);
   // progress from the engine's own counters

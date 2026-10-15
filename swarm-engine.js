@@ -65,17 +65,27 @@ function engLog(level, msg, data) {
     try { chrome.tabs.sendMessage(a.tabId, { type: "engine-log", entry }); } catch {}
   }
   // keep a rolling debug ring for the monitor page
+  // v0.9.9 BUGFIX: `debugRing = ...slice(...)` reassigned the DESTRUCTURED
+  // PARAMETER, not the array that gets written back — push() always won, so
+  // the ring grew past its cap unbounded. Slice into a fresh variable now.
   chrome.storage.local.get({ debugRing: [] }, ({ debugRing }) => {
-    debugRing.push(entry);
-    if (debugRing.length > 300) debugRing = debugRing.slice(-300);
-    chrome.storage.local.set({ debugRing });
+    const ring = debugRing.concat([entry]);
+    chrome.storage.local.set({ debugRing: ring.length > 300 ? ring.slice(-300) : ring });
   });
 }
 
 // ── broadcast swarm state everywhere (HUD pills, popup, monitor) ───────────
 function broadcastState() {
+  // v0.9.9 BUGFIX ("debug dump was just a header line", second half): the
+  // monitor gates ALL engine-mode output on local.swarmState existing, and it
+  // dedupes phase lines on `swarmState.ts > lastSwarmTs`. The payload carried
+  // neither field — so with zero registered agents (broadcastState never ran)
+  // pollEngine bailed to remote discovery and Copy debug produced only the
+  // header; and even once agents existed, ts===undefined made every new phase
+  // fail the comparison → zero state lines in the feed AND the copy buffer.
   const payload = { type: "swarm", state: ENGINE.state, turn: ENGINE.turnCount,
-                    agents: [...ENGINE.agents.keys()], topicChars: ENGINE.topic.length };
+                    agents: [...ENGINE.agents.keys()], topicChars: ENGINE.topic.length,
+                    turns: ENGINE.turns, ts: Date.now() };
   chrome.storage.local.set({ swarmState: payload });
   for (const a of ENGINE.agents.values()) {
     // v0.9.4: fire-and-forget — the old await serialized every tab's promise
@@ -438,9 +448,25 @@ function downloadLastTranscript() {
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   // v0.9.8: handleEngineMessage is async (always a real Promise), but we still
   // route through safeCatch so a polyfilled environment can never throw here.
-  safeCatch(handleEngineMessage(msg, sender, respond), (e) => {
-    try { respond({ ok: false, error: String(e && e.message || e) }); } catch {}
-  });
+  // v0.9.9 BUGFIX ("Receiving end does not exist" / silent drops): the old
+  // bridge discarded handleEngineMessage's return value, so the channel was
+  // NEVER kept open — respond() after the first await tick was already dead
+  // (async cases like "start" hit chrome.storage.get before responding).
+  // The listener must synchronously return true whenever the handler may
+  // answer asynchronously. handleEngineMessage resolves to false only for
+  // synchronous replies; everything else needs the port held open.
+  const p = handleEngineMessage(msg, sender, respond);
+  if (p && typeof p.then === "function") {
+    // keepOpen: undefined ⇒ the message matched no case → close channel quietly.
+    // keepOpen: false   ⇒ handler already answered synchronously → harmless ack.
+    // keepOpen: true    ⇒ handler owns the channel (e.g. activate-tab) → don't touch it.
+    p.then((keepOpen) => {
+      if (keepOpen === undefined || keepOpen === false) { try { respond({ ok: true, ack: true }); } catch {} }
+    }).catch((e) => {
+      try { respond({ ok: false, error: String(e && e.message || e) }); } catch {}
+    });
+    return true;
+  }
 });
 
 async function handleEngineMessage(msg, sender, respond) {
@@ -577,3 +603,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 engLog("INFO", "swarm engine online — python-free mode active (in-browser orchestrator)");
+// v0.9.9 BUGFIX ("Copy debug showed only the header line"): the monitor's
+// engine mode is gated on local.swarmState existing; if it's absent pollEngine
+// bails to remote-orchestrator discovery and the feed (and copy buffer) stays
+// empty until an agent registers. Publish the initial state at boot so the
+// monitor drains debugRing from the very first poll.
+broadcastState();

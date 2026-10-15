@@ -1005,6 +1005,7 @@ if (!CFG) {
       if (m?.type === "status") respond({
         agent: CFG.name, state: state.lastState, turns: state.turns,
         wsOpen: transport?.alive() ?? false, halted: state.halted, transport: transport?.mode || "none",
+        log: LB_LOG.slice(),                                 // v0.9.9: monitor reads engine lines from here
       });
       else if (m?.type === "halt") toggleHalt(!!m.halted);
       return true;

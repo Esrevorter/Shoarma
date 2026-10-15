@@ -80,6 +80,44 @@ document.addEventListener("DOMContentLoaded", async () => {
   // ── open the live monitor any time (works even without native host) ────
   $("monitor").onclick = () => { chrome.runtime.sendMessage({ type: "open-monitor" }); act("monitor tab opened"); };
 
+  // ── v0.6 ▶ START / ■ STOP — talks to the orchestrator over its own WS port,
+  //    exactly like a HUD pill does. The saved Topic + Turns ride the frame. ──
+  let ctlWs = null, ctlRetry = 1000;
+  function ctlConnect() {
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${$("port").value || 8765}`);
+      ctlWs = ws;
+      ws.onopen = () => { ctlRetry = 1000; };
+      ws.onmessage = (ev) => {
+        let m; try { m = JSON.parse(ev.data); } catch { return; }
+        if (m.type === "swarm") applyPhase(m.state);
+      };
+      ws.onclose = () => { ctlWs = null; setTimeout(ctlConnect, Math.min(ctlRetry *= 1.5, 4000)); };
+      ws.onerror = () => { try { ws.close(); } catch {} };
+    } catch {}
+  }
+  ctlConnect();
+
+  function applyPhase(ph) {
+    const startBtn = $("start-run"), stopBtn = $("stop-run");
+    startBtn.disabled = ph !== "armed";
+    startBtn.textContent = ph === "armed" ? "▶ Start swarm" : "▶ Start swarm";
+    stopBtn.hidden = ph !== "running";
+    if (ph === "armed") setHint("Orchestrator is ARMED and waiting — press ▶ Start swarm (topic below is used).", "ok");
+    if (ph === "running") { setHint("Swarm running — watch it in the 📟 monitor.", "ok"); launched = true; setStep(3); }
+    if (ph === "done") setHint("Run finished. Transcript saved next to orchestrator.py.", "ok");
+  }
+
+  $("start-run").onclick = () => {
+    if (ctlWs?.readyState !== 1) { setHint("Can't reach the orchestrator yet — did you press 🖥️ Start orchestrator (or run python orchestrator.py)?", "err"); return; }
+    ctlWs.send(JSON.stringify({ type: "start", topic: $("topic").value.trim(), turns: clamp($("turns").value, 1, 50) }));
+    act("▶ start sent from popup with popup topic (" + $("topic").value.trim().length + " chars)");
+    $("start-run").disabled = true;
+  };
+  $("stop-run").onclick = () => {
+    if (ctlWs?.readyState === 1) { ctlWs.send(JSON.stringify({ type: "stop" })); act("■ stop sent from popup"); }
+  };
+
   // ── centralized activity log buttons ───────────────────────────────────
   $("copy-log").onclick = async () => {
     const header = `=== Shoarma popup activity · ${new Date().toISOString()} · v${chrome.runtime.getManifest().version} ===\n`;
@@ -182,6 +220,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         else if (ev.type === "log" && (ev.level === "WARN" || ev.level === "ERROR"))
           act(`[${ev.agent}] ${ev.level}: ${clip(ev.msg, 120)}`);
       }
+      const sw = (st.agents || {})._swarm;
+      if (sw && sw.state && sw.state !== "running") applyPhase(sw.state);
+      else if (sw && sw.state === "running") applyPhase("running");
       const replies = evs.filter((e) => e.type === "reply").length;
       const totalTurns = clamp(($("turns").value || 6), 1, 50) * 2;
       const pct = Math.min(100, Math.round(replies / totalTurns * 100));

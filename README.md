@@ -20,6 +20,20 @@
 
 ---
 
+
+## v0.6 — Start when YOU say start
+
+- **No more auto-fire.** Launching `orchestrator.py` only *arms* the swarm: it
+  waits until you press **▶ Start swarm** (popup, HUD pill, or the monitor page).
+- **Your Topic is honored.** The popup's Topic/Turns travel with the ▶ frame, so
+  the question you typed is what the agents receive — not the built-in debate.
+- **Qwen confirm-gate.** After each reply the bridge auto-clicks the site's
+  "prefer this response"-style confirmation when it can find one; if the label
+  changed, the debug dump now lists the actual buttons it saw.
+- **No placeholder spirals.** A failed capture is retried once per hop and never
+  relayed to the other debater as if it were an argument.
+- HUD pills got plain ▶ Start / ■ Stop buttons; the popup shows the swarm phase.
+
 ## 🥩 What Shoarma Is
 
 Shoarma is a tiny **Chrome extension + Python referee** that turns two free, authenticated LLM web UIs — currently **Qwen** and **DeepSeek** — into autonomous conversational agents that argue *with each other*, on a loop, while you watch. No API keys, no quota purchases: it drives the chat websites you already log into, reusing your existing session.

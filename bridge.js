@@ -36,7 +36,14 @@ const SITES = {
     input:      'textarea',
     send:       'button[type="submit"], button[aria-label*="Send" i]',
     bubbles:    '[data-role="assistant"], .markdown-body, [class*="assistant"] [class*="content"]',
-    stop:       'button[aria-label*="Stop" i]',
+    stop:       'button[aria-label*="Stop" i], button[aria-label*="stop" i], button[title*="stop" i]',
+    // v0.6 CONFIRM STEP: qwen asks you to pick between generated responses —
+    // a follow-up typed into the box then sits there until YOU click something.
+    // These selectors auto-click that confirmation once generation settles.
+    // ⚠️ Site-dependent: verify labels in DevTools and extend as needed.
+    confirm:    'button[aria-label*="confirm" i], button[aria-label*="best response" i], ' +
+                'button[aria-label*="this response" i], button[aria-label*="good response" i], ' +
+                'button[data-testid*="confirm" i]',
   },
 };
 
@@ -212,12 +219,20 @@ if (!CFG) {
     return t.length < 400 && !/[.!?…:;"'\)\]»”’]$/.test(t.trim());
   }
   async function captureReply(baseline) {
+    await confirmGate();                              // v0.6 qwen preference gate
     let text = lastAssistantText(baseline);
     if (looksTruncated(text)) {
       lbLog("INFO", "reply looks truncated — waiting one more settle window", { chars: text.length });
       await waitForIdle({ quietMs: 1200, timeoutMs: 30000 });
       const again = lastAssistantText(baseline);
       if (again.length > text.length) { lbLog("INFO", "longer capture after liveness re-check", { was: text.length, now: again.length }); text = again; }
+    }
+    if (text === "(no response captured)") {          // maybe the gate just opened late
+      if (await confirmGate()) {
+        await waitForIdle({ quietMs: 900, timeoutMs: 25000 });
+        const t3 = lastAssistantText(baseline);
+        if (t3 !== "(no response captured)") text = t3;
+      }
     }
     return text;
   }
@@ -226,6 +241,35 @@ if (!CFG) {
     // short UI-vocabulary strings ("I prefer this response", "Copy", 👍 labels)
     return t.length < 60 && CHROME_HINT.test(t) && !/[.!?…]"']$/.test(t);
   }
+  // v0.6 CONFIRM STEP — qwen's "which response do you prefer?" gate leaves a
+  // follow-up sitting unsent until someone clicks. After each settled stream
+  // we scan light DOM + shadow roots for a confirm-ish button and click it
+  // once; if nothing matches we log the visible buttons so the debug dump
+  // tells us exactly what label the real UI uses (then extend CFG.confirm).
+  async function confirmGate() {
+    if (!CFG.confirm) return false;
+    const hits = [];
+    (function scan(root, d) {
+      if (d > 5) return;
+      try { hits.push(...root.querySelectorAll(CFG.confirm)); } catch {}
+      for (const h of root.querySelectorAll("*")) if (h.shadowRoot) scan(h.shadowRoot, d + 1);
+    })(document, 0);
+    const btn = hits.find(b => !b.disabled && b.offsetParent !== null);
+    if (btn) {
+      lbLog("INFO", "confirm gate: clicking through", { label: (btn.getAttribute("aria-label") || btn.textContent || "").trim().slice(0, 60) });
+      btn.click();
+      await sleep(400);
+      return true;
+    }
+    try {
+      const all = [...document.querySelectorAll("button")]
+        .map(b => (b.getAttribute("aria-label") || b.title || b.textContent || "").trim())
+        .filter(s => s && s.length <= 30);
+      lbLog("DEBUG", "confirm gate: no match", { uniqButtons: [...new Set(all)].slice(0, 25) });
+    } catch { lbLog("DEBUG", "confirm gate: no match"); }
+    return false;
+  }
+
   function lastAssistantText() {
     const nodes = assistantNodes();
     lbLog("DEBUG", "scanning assistant bubbles", { candidates: nodes.length });
@@ -268,9 +312,11 @@ if (!CFG) {
       <span class="lb-agent">${CFG.name}</span>
       <span class="lb-state">connecting…</span>
       <span class="lb-stats"></span>
-      <button class="lb-btn lb-danger" title="Pause / resume this agent (Esc)">⏸ Pause</button>
+      <button class="lb-btn lb-start" id="lb-start" title="Start the swarm with your popup Topic">▶ Start</button>
+      <button class="lb-btn lb-stop" id="lb-stop" title="Stop the swarm after the current turn" hidden>■ Stop</button>
+      <button class="lb-btn lb-danger" title="Pause / resume this agent (Esc)">⏸</button>
       <button class="lb-btn" id="lb-copy" title="Copy debug log to clipboard">📋</button>
-      <button class="lb-btn lb-hide" title="Hide this pill — Esc brings it back, and the Live monitor keeps watching">✕</button>`;
+      <button class="lb-btn lb-hide" title="Collapse this pill">—</button>`;
     // inline fallback in case the page's CSP blocks the content-script stylesheet
     box.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;" +
       "display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:14px;" +
@@ -278,7 +324,9 @@ if (!CFG) {
       "border:1px solid #fff2;opacity:.9";
     document.body.appendChild(box);
     box.querySelector(".lb-danger").onclick = () => toggleHalt();
-    box.querySelector(".lb-hide").onclick = () => hudEl.classList.toggle("lb-hidden");
+    box.querySelector(".lb-hide").onclick = () => hudEl.classList.toggle("lb-min");
+    box.querySelector("#lb-start").onclick = startSwarm;
+    box.querySelector("#lb-stop").onclick = stopSwarm;
     box.querySelector("#lb-copy").onclick = async (ev) => {
       const btn = ev.currentTarget;
       try { await navigator.clipboard.writeText(globalThis.__lbLog()); }
@@ -315,6 +363,23 @@ if (!CFG) {
     feedMonitor(label);
   }
 
+  // ── v0.6 START/STOP — the orchestrator ARM-waits for a human trigger; the
+  //    ▶ button on ANY connected pill (or the popup's Start) fires it, carrying
+  //    the saved popup Topic + Turns so the question you typed is honored. ────
+  function sendCtl(obj) {
+    if (state.ws?.readyState === 1) { state.ws.send(JSON.stringify(obj)); return true; }
+    lbLog("WARN", "cannot " + obj.type + " — not connected to orchestrator yet"); return false;
+  }
+  function startSwarm() {
+    chrome.storage.sync.get({ topic: "", turns: 6 }, (cfg) => {
+      if (sendCtl({ type: "start", topic: cfg.topic || "", turns: Number(cfg.turns) || 6 })) {
+        lbLog("INFO", "▶ start sent from HUD", { topicChars: (cfg.topic || "").length });
+        hud("armed… waiting for first hop");
+      }
+    });
+  }
+  function stopSwarm() { if (sendCtl({ type: "stop" })) lbLog("INFO", "■ stop sent from HUD"); }
+
   // ── Connection ─────────────────────────────────────────────────────────────
   let backoff = 1000;
   function connect() {
@@ -326,12 +391,22 @@ if (!CFG) {
       backoff = 1000;                                 // reset on success
       lbLog("INFO", "websocket connected → registering as " + CFG.name, { url: WS_URL });
       ws.send(JSON.stringify({ type: "register", agent: CFG.name }));
-      hud("ready");
+      hudEl.querySelector("#lb-start").hidden = false;
+      hud("ready · press ▶");
       try { chrome.runtime.sendMessage({ type: "agent-count" }); } catch {}
     };
 
     ws.onmessage = async (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch (e) { lbLog("ERROR", "bad frame from orchestrator (JSON parse)", { raw: String(ev.data).slice(0, 200), err: String(e) }); return; }
+      if (msg.type === "resume") { lbLog("INFO", "orchestrator mid-run — tab rejoined"); hud("thinking…"); return; }
+      if (msg.type === "swarm") {                      // armed/running/done mirror
+        state.swarm = msg.state;
+        hudEl.querySelector("#lb-start").hidden = msg.state !== "armed";
+        hudEl.querySelector("#lb-stop").hidden = msg.state !== "running";
+        if (msg.state === "armed") hud("ready · press ▶");
+        if (msg.state === "done") hud("idle");
+        return;
+      }
       if (msg.type !== "say" || state.halted) { if (state.halted && msg.type === "say") lbLog("WARN", "dropping incoming say while HALTED", { preview: String(msg.text).slice(0, 60) }); return; }
 
       const t0 = performance.now();

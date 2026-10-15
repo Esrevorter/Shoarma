@@ -63,6 +63,38 @@ async function discoverPort() {
   return null;
 }
 
+// v0.6: the monitor can start/stop the swarm too — direct WS to the port.
+let ctlWs = null, ctlBackoff = 1000;
+function ctlConnect() {
+  chrome.storage.sync.get({ port: 8765 }, ({ port }) => {
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+      ctlWs = ws;
+      ws.onmessage = (ev) => {
+        let m; try { m = JSON.parse(ev.data); } catch { return; }
+        if (m.type === "swarm") {
+          const b1 = document.getElementById("ctl-start"), b2 = document.getElementById("ctl-stop");
+          if (b1) b1.style.display = m.state === "armed" ? "" : "none";
+          if (b2) b2.style.display = m.state === "running" ? "" : "none";
+        }
+      };
+      ws.onclose = () => { ctlWs = null; setTimeout(ctlConnect, Math.min(ctlBackoff = ctlBackoff * 1.5, 5000)); };
+      ws.onerror = () => { try { ws.close(); } catch {} };
+    } catch {}
+  });
+}
+ctlConnect();
+document.addEventListener("click", (e) => {
+  if (e.target.id === "ctl-start") {
+    chrome.storage.sync.get({ topic: "", turns: 6 }, (cfg) => {
+      if (ctlWs?.readyState === 1) ctlWs.send(JSON.stringify({ type: "start", topic: cfg.topic, turns: cfg.turns }));
+      e.target.disabled = true; e.target.textContent = "▶ starting…";
+      setTimeout(() => { e.target.disabled = false; e.target.textContent = "▶ Start swarm"; }, 3000);
+    });
+  }
+  if (e.target.id === "ctl-stop" && ctlWs?.readyState === 1) ctlWs.send(JSON.stringify({ type: "stop" }));
+});
+
 chrome.storage.sync.get({ halted: false }, (cfg) => {
   $("halted").checked = !!cfg.halted;
   poll(); setInterval(poll, 800);

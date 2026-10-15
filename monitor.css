@@ -98,3 +98,7 @@ main { flex: 1; display: grid; grid-template-columns: 1fr 300px; gap: 18px;
 input[type="checkbox"] { accent-color: var(--cyan); width: 15px; height: 15px; }
 
 footer { padding: 10px 22px; border-top: 1px solid var(--line); font-size: 11.5px; }
+
+/* v0.6 */
+.btn.go { background: linear-gradient(135deg,#2dd4a7,#4cc9f0); color:#06231b; font-weight:800; }
+.btn.stop { background: rgba(255,92,122,.15); color:#ff8ba1; border-color:rgba(255,92,122,.4); }

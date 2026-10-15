@@ -5,6 +5,11 @@
 #       files are unreadable (Windows Chrome blocks local-file fetches).
 #       Also: graceful stand-down if a second instance is launched, unified
 #       centralized run.log, popup stepper/progress/activity-log assets kept.
+# v0.6: THE RUN IS ARMED, NOT AUTOMATIC. Connecting two tabs no longer fires
+#       the swarm — you press ▶ Start swarm (HUD pill or popup) and YOUR TOPIC
+#       from the popup travels with that start frame (the old auto-start was
+#       why the HUD question was silently ignored). The opening prompt is
+#       wrapped so debaters never receive a bare "(no response captured)".
 # pip install websockets
 
 import argparse, asyncio, json, logging, os, time
@@ -85,6 +90,15 @@ class Hub:
 
     def agent(self, name: str, **kw):
         self.agents.setdefault(name, {"state": "?", "turns": 0}).update(kw)
+
+    # v0.6: every WS connection, so we can push swarm-state frames to all tabs
+    sockets: set = None
+    async def broadcast(self, obj: dict):
+        if not self.sockets: return
+        raw = json.dumps(obj)
+        for w in list(self.sockets):
+            try: await w.send(raw)
+            except Exception: pass
 
     def snapshot(self, feed_port: int | None = None) -> bytes:
         return json.dumps({"agents": self.agents, "events": self.events,
@@ -183,9 +197,11 @@ def log_turn(entry: dict, transcript: list, path: Path):
     write_utf8(path, json.dumps(transcript, indent=2, ensure_ascii=False))
 
 
-async def handler(ws, agents: dict, pending: dict, hub: Hub):
+async def handler(ws, agents: dict, pending: dict, hub: Hub, control: dict):
     name = None
+    hub.sockets.add(ws)
     try:
+        await ws.send(json.dumps({"type": "swarm", "state": control["phase"]}))
         async for raw in ws:
             msg = json.loads(raw)
             if msg["type"] == "register":
@@ -193,6 +209,23 @@ async def handler(ws, agents: dict, pending: dict, hub: Hub):
                 agents[name] = ws
                 hub.agent(name, state="ready")
                 emit(f"[+] node online: {name}", hub)
+                # v0.6: a tab that reloads mid-run re-registers — hand it back
+                # its turn slot so the debate can resume where it stopped.
+                if control.get("running"):
+                    await ws.send(json.dumps({"type": "resume"}))
+            elif msg["type"] == "start":
+                # v0.6: explicit human trigger (HUD ▶ / popup Start). The topic
+                # rides THIS frame — that's why the popup question is honored
+                # now instead of the built-in default being auto-fired.
+                if not control["start_evt"].done():
+                    control["topic"] = (msg.get("topic") or "").strip()
+                    control["turns"] = msg.get("turns") or control.get("turns")
+                    control["start_evt"].set_result(True)
+                    emit(f"▶ start received from {name} — topic: "
+                         f"{(control['topic'][:70] or '(default)')}", hub)
+            elif msg["type"] == "stop":
+                control["stop_flag"] = True
+                emit(f"■ stop received from {name}", hub)
             elif msg["type"] == "log":                     # agent debug frame
                 hub.add({"type": "log", "agent": msg.get("agent", name),
                          "level": msg.get("level", "INFO"), "msg": str(msg.get("msg", ""))[:300],
@@ -208,6 +241,7 @@ async def handler(ws, agents: dict, pending: dict, hub: Hub):
                 if fut and not fut.done():
                     fut.set_result(f"{tag}{msg.get('text','')}")
     finally:
+        hub.sockets.discard(ws)
         if name:
             agents.pop(name, None)
             hub.agent(name, state="offline")
@@ -236,6 +270,27 @@ def port_in_use(port: int) -> bool:
         s.close()
 
 
+# v0.6: a failed capture must NEVER be relayed to the other debater as if it
+# were an argument — that's what made both AIs spiral into "paste your
+# question again" confusion loops. The fallback keeps the conversation alive.
+RETRY_NOTE = ("(Your previous message did not reach me — the bridge lost my "
+              "reply. Please restate your last point briefly and continue the "
+              "debate.)")
+
+
+async def ask_robust(agents, pending, hub, agent, text, timeout, retries=1):
+    """ask() + capture validation. Returns (text, ok)."""
+    for attempt in range(retries + 1):
+        got = await ask(agents, pending, hub, agent, text, timeout)
+        bad = got.startswith("ERR") or "(no response captured)" in got or len(got.strip()) < 3
+        if not bad:
+            return got, True
+        hub.add({"type": "log", "agent": agent, "level": "WARN",
+                 "msg": f"capture failed (attempt {attempt + 1}) — retrying hop"})
+        emit(f"[{agent}] capture failed, retrying this hop…", hub)
+    return RETRY_NOTE, False
+
+
 async def main():
     s = load_settings()
     ap = argparse.ArgumentParser(description="LLM Bridge orchestrator")
@@ -258,6 +313,9 @@ async def main():
     agents: dict[str, object] = {}
     pending: dict[str, asyncio.Future] = {}
     transcript: list[dict] = []
+    control = {"start_evt": asyncio.get_running_loop().create_future(),
+               "topic": None, "turns": args.turns, "running": False,
+               "stop_flag": False, "phase": "waiting"}
 
     run_dir = Path(os.environ.get("SHOARMA_HOME", "."))
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -266,6 +324,7 @@ async def main():
     log_path = run_dir / f"run-{tstamp}.log"          # centralized copy-paste log
     debug_path = run_dir / f"debug-{tstamp}.log"
     hub = Hub(log_path=log_path)                       # every event → run.log too
+    hub.sockets = set()
 
     ws_log_handler = logging.FileHandler(debug_path, encoding="utf-8")
     ws_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -284,35 +343,58 @@ async def main():
     except OSError:
         pass
     async with __import__("websockets").serve(
-            lambda ws: handler(ws, agents, pending, hub), HOST, args.port,
+            lambda ws: handler(ws, agents, pending, hub, control), HOST, args.port,
             process_request=make_process_request(hub_ref)):
         emit(f"ws://{HOST}:{args.port} — open both tabs, waiting for {sorted(AGENTS_EXPECTED)}", hub)
         emit(f"live monitor feed: http://127.0.0.1:{http_port}/state  "
              f"(also served directly on http://127.0.0.1:{args.port}/state)", hub)
         while not AGENTS_EXPECTED.issubset(agents):
             await asyncio.sleep(0.3)          # snappier readiness detection
-        emit("both agents online. starting.\n", hub)
+        emit("both agents online.", hub)
+        control["phase"] = "armed"
+        await hub.broadcast({"type": "swarm", "state": "armed"})
+        emit("⏸ ARMED — nothing will be typed yet. Press ▶ Start swarm in the "
+             "Shoarma popup (or a tab's HUD pill). Your popup Topic is used; "
+             "empty topic = built-in debate starter.", hub)
+        hub.agent("_swarm", state="armed")
 
-        msg = opening
+        try:
+            await asyncio.wait_for(control["start_evt"], timeout=None)
+        except asyncio.CancelledError:
+            raise
+        if control["stop_flag"]:
+            emit("run stopped before it began.", hub)
+            return
+        turns = int(control.get("turns") or args.turns)
+        msg = control.get("topic") or opening      # popup topic WINS over default
+        control["running"] = True
+        control["phase"] = "running"
+        await hub.broadcast({"type": "swarm", "state": "running"})
+        hub.agent("_swarm", state="running")
+        emit(f"▶ running {turns} rounds · opening: {msg[:80]}\n", hub)
+
         aborted = False
-        for turn in range(1, args.turns + 1):
+        for turn in range(1, turns + 1):
+            if control["stop_flag"]:
+                emit("■ stop requested — ending after last completed turn.", hub)
+                break
             try:
                 # Sequential debate chain: B must see A's fresh argument to
                 # rebut it, so hops stay ordered — but each hop starts the
                 # instant the previous reply lands (no polling gaps).
                 a, b = order if turn % 2 else order[::-1]
                 t0 = time.monotonic()
-                ra = await ask(agents, pending, hub, a, msg, args.timeout)
+                ra, ok_a = await ask_robust(agents, pending, hub, a, msg, args.timeout)
                 mid = time.monotonic() - t0
-                log_turn({"turn": turn, "agent": a, "seconds": round(mid, 1), "text": ra},
-                         transcript, out_path)
+                log_turn({"turn": turn, "agent": a, "seconds": round(mid, 1),
+                          "text": ra, "captured": ok_a}, transcript, out_path)
                 hub.add({"type": "reply", "agent": a, "turn": turn,
                          "seconds": round(mid, 1), "text": ra})
                 emit(f"<<< {a}: {ra[:400]}", hub)
-                rb = await ask(agents, pending, hub, b, ra, args.timeout)
+                rb, ok_b = await ask_robust(agents, pending, hub, b, ra, args.timeout)
                 tot = time.monotonic() - t0
-                log_turn({"turn": turn, "agent": b, "seconds": round(tot - mid, 1), "text": rb},
-                         transcript, out_path)
+                log_turn({"turn": turn, "agent": b, "seconds": round(tot - mid, 1),
+                          "text": rb, "captured": ok_b}, transcript, out_path)
                 hub.add({"type": "reply", "agent": b, "turn": turn,
                          "seconds": round(tot - mid, 1), "text": rb})
                 emit(f"<<< {b}: {rb[:400]}", hub)
@@ -323,6 +405,10 @@ async def main():
                 aborted = True
                 break
 
+        control["running"] = False
+        control["phase"] = "done"
+        await hub.broadcast({"type": "swarm", "state": "done"})
+        hub.agent("_swarm", state="done")
         if not aborted:
             emit(f"\nsaved {len(transcript)} turns → {out_path}", hub)
         else:

@@ -28,8 +28,12 @@
     <div class="progress"><div id="pbar" class="pbar" style="width:0%"></div></div>
     <p id="ptext" class="ptext"></p>
     <div class="row">
-      <button id="launch" class="big">🚀 Launch swarm</button>
-      <button id="monitor" class="ghost side">📟 Live monitor</button>
+      <button id="launch" class="big">🖥️ Start orchestrator</button>
+      <button id="start-run" class="big go" disabled>▶ Start swarm</button>
+      <button id="stop-run" class="ghost side stop" hidden>■ Stop</button>
+    </div>
+    <div class="row">
+      <button id="monitor" class="ghost side">📟 Open live monitor</button>
     </div>
     <p id="launch-hint" class="hint"></p>
   </section>

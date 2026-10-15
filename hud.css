@@ -69,3 +69,10 @@
 .lb-btn:hover { background: rgba(255, 255, 255, 0.16); }
 .lb-btn.lb-danger:hover { background: rgba(255, 92, 122, .25); color: #ff8ba1; }
 .lb-btn.lb-on { background: rgba(255, 92, 122, .35); color: #ffb3c2; }
+
+/* v0.6 — clear primary actions on the pill */
+.lb-btn.lb-start { background: rgba(45, 212, 167, .22); border-color: rgba(45, 212, 167, .45); color: #7ef0cf; font-weight: 700; }
+.lb-btn.lb-start:hover { background: rgba(45, 212, 167, .38); }
+.lb-btn.lb-stop { background: rgba(255, 92, 122, .18); border-color: rgba(255, 92, 122, .4); color: #ff8ba1; }
+.lb-btn.lb-stop:hover { background: rgba(255, 92, 122, .32); }
+.lb-btn[hidden] { display: none; }

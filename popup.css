@@ -162,3 +162,8 @@ pre.activity {
   border: 1px solid var(--line); font: 400 10.5px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
   color: #b9c2d0; white-space: pre-wrap; word-break: break-word;
 }
+
+/* v0.6 */
+button.go { background: linear-gradient(135deg,#2dd4a7,#4cc9f0); color:#06231b; font-weight:800; }
+button.go:disabled { opacity:.45; filter:grayscale(.4); cursor:not-allowed; }
+button.stop { color:#ff8ba1; border-color:rgba(255,92,122,.4); }

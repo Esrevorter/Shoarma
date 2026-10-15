@@ -1,15 +1,25 @@
 {
   "manifest_version": 3,
   "name": "LLM Bridge",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Bridges two authenticated LLM web UIs into a self-driving conversation.",
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Shoarma — LLM Bridge control deck",
-    "default_icon": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+    "default_title": "Shoarma \u2014 LLM Bridge control deck",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
-  "background": { "service_worker": "background.js" },
-  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* file:///*"
   },

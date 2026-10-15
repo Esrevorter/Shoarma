@@ -6,6 +6,29 @@
 let WS_URL = "ws://127.0.0.1:8765";   // re-derived from the saved port below
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ── TRANSPORT ABSTRACTION (v0.9) ────────────────────────────────────────────
+// Two ways to reach an orchestrator:
+//   • "engine": the in-browser swarm-engine.js service worker (python-free
+//     default) — chrome.runtime messaging, no sockets, no localhost.
+//   • "ws": a remote orchestrator.py over ws://127.0.0.1:<port>.
+// Both expose the same frame vocabulary: register / say / reply / send_failed
+// / error / start / stop / halted / clear_input / state / swarm.
+let transport = null;                 // { mode, send(obj), alive() }
+function setEngineTransport() {
+  transport = {
+    mode: "engine",
+    send(obj) { try { chrome.runtime.sendMessage({ ...obj, agent: CFG.name }); } catch {} },
+    alive() { return true; },
+  };
+}
+function setWsTransport(ws) {
+  transport = {
+    mode: "ws",
+    send(obj) { try { ws.readyState === 1 && ws.send(JSON.stringify(obj)); } catch {} },
+    alive() { return ws.readyState === 1; },
+  };
+}
+
 // ── DEBUG LOG ────────────────────────────────────────────────────────────────
 // Every action is timestamped into a 300-entry ring buffer. Copy it with one
 // click (HUD 📋 button) or from the console: __lbLog(). Sent to the orchestrator
@@ -17,7 +40,7 @@ function lbLog(level, msg, data) {
   LB_LOG.push(e); if (LB_LOG.length > 300) LB_LOG.shift();
   (level === "ERROR" ? console.warn : console.log)(`[Shoarma ${e.agent}] ${level}: ${msg}`, data ?? "");
   try { chrome.runtime.sendMessage({ type: "log", entry: e }); } catch {}
-  try { state.ws?.readyState === 1 && state.ws.send(JSON.stringify({ type: "log", agent: e.agent, level, msg, data: e.data })); } catch {}
+  try { transport?.send({ type: "log", agent: e.agent, level, msg, data: e.data }); } catch {}
 }
 globalThis.__lbLog = () => LB_LOG.map(e => `${e.ts} ${e.level.padEnd(5)} ${e.msg}${e.data !== undefined ? " :: " + JSON.stringify(e.data).slice(0, 300) : ""}`).join("\n");
 
@@ -53,16 +76,18 @@ if (!CFG) {
   console.warn("LLM Bridge: no site config for", location.hostname);
 } else {
   const state = { halted: false, ws: null, turns: 0, lastMs: 0, lastState: "connecting" };
+  let busy = false;                                   // v0.8.3: single-flight turn guard
+  let pendingSay = null;                              // v0.8.3: newest say queued while busy
 
   // ── Monitor feed (v0.4): the orchestrator mirrors everything into a Hub that
   //    the third-page live monitor polls. We push HUD state changes upstream so
   //    the monitor shows exactly what every tab's pill shows. ─────────────────
   function feedMonitor(label) {
     try {
-      state.ws?.readyState === 1 && state.ws.send(JSON.stringify({
+      transport?.send({
         type: "state", agent: CFG.name, state: label.toLowerCase().replace(/…/g, "").trim(),
         turns: state.turns,
-      }));
+      });
     } catch {}
   }
 
@@ -86,6 +111,7 @@ if (!CFG) {
   // internal state never updates and Send stays disabled. You must call the
   // native prototype setter and dispatch a bubbling 'input' event.
   function setNativeValue(el, value) {
+    if (isCE(el)) { setCEValue(el, value); return; }
     // v0.7: clear first, then write — some sites (qwen) keep internal
     // composition state that makes a single set look like "text present but
     // nothing typed" to their React handlers.
@@ -98,6 +124,64 @@ if (!CFG) {
     desc(proto).set.call(el, value);
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));   // belt & braces
+  }
+
+  // ── v0.8.2: contenteditable support. Qwen's editor is sometimes a plain
+  // <textarea> and sometimes a CE div ("ime-text-area") whose React handler
+  // IGNORES synthetic events on the host and reads its model from the hidden
+  // IME proxy textarea instead. That's why 9k-char messages sat in the box
+  // forever: text was visible, state was empty, Send stayed disabled.
+  // The reliable path for CE editors is an *executed* beforeinput event with
+  // inputType "insertFromDrop"/"insertText" — execCommand routes through the
+  // browser's own editing pipeline so the framework sees real mutations.
+  const isCE = (el) => !!el && (el.getAttribute?.("contenteditable") === "true" ||
+                                 el.getAttribute?.("contenteditable") === "plaintext-only");
+  function setCEValue(el, value) {
+    try { document.execCommand("selectAll"); } catch {}
+    let ok = false;
+    try {
+      const evt = new InputEvent("beforeinput", {
+        bubbles: true, cancelable: true, composed: true,
+        inputType: "insertFromDrop", data: value,
+      });
+      ok = el.dispatchEvent(evt) === false;           // false ⇒ app called preventDefault ⇒ handled
+    } catch {}
+    if (!ok) {
+      try { ok = document.execCommand("insertText", false, value); } catch { ok = false; }
+    }
+    if (!ok || !readBox(el).trim()) {                 // last resort: direct DOM write
+      el.textContent = value;
+    }
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: value }));
+  }
+  function ceInsertAtCaret(el, chunk) {
+    // v0.8.2: retype fallback used to rewrite the WHOLE buffer per character —
+    // O(n²), ~140s for a 9k message, and it interleaved every char with the
+    // site's own caret writes (the scrambled boxes in the user log). Now we
+    // insert small chunks at the caret via one executed beforeinput each.
+    try {
+      const sel = window.getSelection();
+      const range = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+      const inside = range && (el.contains(range.startContainer) || range.startContainer === el);
+      if (!inside) {                                   // place caret at end of editor
+        const r = document.createRange();
+        r.selectNodeContents(el); r.collapse(false);
+        sel.removeAllRanges(); sel.addRange(r);
+      }
+    } catch {}
+    let ok = false;
+    try {
+      const evt = new InputEvent("beforeinput", {
+        bubbles: true, cancelable: true, composed: true,
+        inputType: "insertText", data: chunk,
+      });
+      ok = el.dispatchEvent(evt) === false;
+    } catch {}
+    if (!ok) { try { ok = document.execCommand("insertText", false, chunk); } catch { ok = false; } }
+    if (!ok) {                                         // manual append fallback
+      try { el.appendChild(document.createTextNode(chunk)); } catch {}
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: chunk }));
+    }
   }
 
   // v0.7: synthetic key events Chrome would normally refuse to forge from a
@@ -169,6 +253,8 @@ if (!CFG) {
     doc = doc || document;
     const sel = CFG.input || "textarea";
     try {
+      // v0.8.2: the site's OWN input selector wins (a real <textarea> is never
+      // mistaken for the hidden IME proxy textarea CE editors keep around).
       for (const s of [sel, 'textarea:not([type="hidden"])', '[contenteditable="true"]', '[contenteditable="plaintext-only"]']) {
         if (!s) continue;
         for (const el of doc.querySelectorAll(s)) {
@@ -180,6 +266,26 @@ if (!CFG) {
       }
     } catch {}
     return null;
+  }
+
+  // ── v0.8.2: React state probe. The single most useful diagnostic we ever
+  // lacked: a box can LOOK full (readBox returns text) while React's internal
+  // value is "" — which is exactly why send clicks silently did nothing and
+  // turns captured STALE replies. Reading the element's __reactFiber/__reactProps
+  // chain tells us whether our injection actually landed in the app's model.
+  function reactValueOf(el) {
+    try {
+      for (const k of Object.keys(el)) {
+        if (!k.startsWith("__reactFiber$") && !k.startsWith("__reactProps$")) continue;
+        let node = el[k], hops = 0;
+        while (node && hops++ < 30) {
+          const p = node.memoizedProps || node.pendingProps;
+          if (p && typeof p.value === "string") return p.value;
+          node = node.return;
+        }
+      }
+    } catch {}
+    return null;                                       // no fiber found — unknown
   }
 
   function readBox(el) {
@@ -206,6 +312,7 @@ if (!CFG) {
   // captured as a whole reply (user log 10:48:07/10:48:32). Treat it as chrome.
   const CHROME_EXACT = /^(thinking completed|deep thinking|analyzing\.\.\.|stop|new chat|scroll to top)[\s.!…]*$/i;
   let lastSentText = "";
+  let lastCapturedNorm = "";                          // v0.8.3: stale-reply guard
 
   function isInsideUserTurn(el) {
     for (let n = el, d = 0; n && d < 12; n = n.parentElement, d++) {
@@ -276,6 +383,18 @@ if (!CFG) {
         lbLog("WARN", `injection attempt ${attempt}: box still empty after setNativeValue`, { tag: el.tagName, cls: String(el.className).slice(0, 80) });
         continue;
       }
+      // v0.8.2: React-state verification. If the fiber's controlled value is
+      // "" while the DOM looks full, NO send channel can work — the app
+      // literally believes the box is empty. Log it loudly and skip straight
+      // to the retype fallback instead of burning 3 × 6 seconds on dead clicks.
+      const rv = reactValueOf(el);
+      if (rv !== null && !rv.trim() && text.trim()) {
+        lbLog("WARN", `injection attempt ${attempt}: DOM full but React state EMPTY — synthetic events ignored by editor`,
+              { tag: el.tagName, ce: isCE(el), domChars: readBox(el).length });
+        if (attempt < 3) continue;
+      } else if (rv !== null) {
+        lbLog("DEBUG", `react state ok (${rv.length} chars)`, { attempt });
+      }
 
       // Try every send channel, verifying after each that the box EMPTIED
       // (emptied box == the site consumed the message).
@@ -300,24 +419,34 @@ if (!CFG) {
       if (!submitted && attempt < 3) lbLog("WARN", `message still sitting in box after attempt ${attempt} — re-injecting`);
     }
 
-    // v0.7.1→v0.8: last resort for stubborn contenteditable inputs (qwen uses
-    // one in some builds). Retype ONE CHARACTER AT A TIME with real input +
-    // keydown events per char, then Enter + button click. This mimics human
-    // typing closely enough that editor keydown handlers fire reliably.
+    // v0.7.1→v0.8→v0.8.2: last resort for stubborn editors. The old retype
+    // rewrote the ENTIRE buffer per character (O(n²), ~140s for a 9k message)
+    // and its synthetic events fed the site's caret handler too — producing
+    // interleaved garbage like "H:e\nrOeb'jse...". New approach: clear once,
+    // then insert SMALL CHUNKS at the caret via executed beforeinput /
+    // execCommand so React commits state between chunks. ~30× faster and the
+    // text lands in order.
     if (!submitted && readBox(el).trim()) {
-      lbLog("WARN", "button/submit/Enter all failed — per-character retype (real keystroke simulation)", { remaining: readBox(el).trim().slice(0, 40) });
+      lbLog("WARN", "button/submit/Enter all failed — chunked caret retype", { remaining: readBox(el).trim().slice(0, 40) });
       await activateSelf("retype");                   // needs real focus most of all
       try {
-        setNativeValue(el, "");
-        for (const ch of text) {
+        setNativeValue(el, "");                       // ONE clean clear
+        el.focus({ preventScroll: true });
+        const CH = isCE(el) ? 64 : 120;               // CE handlers commit slower
+        for (let i = 0; i < text.length; i += CH) {
           el.focus({ preventScroll: true });
-          const before = readBox(el);
-          setNativeValue(el, before + ch);
-          el.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: ch }));
-          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: ch }));
-          await sleep(10 + Math.random() * 14);
+          const chunk = text.slice(i, i + CH);
+          if (isCE(el)) ceInsertAtCaret(el, chunk);
+          else {
+            const before = readBox(el);
+            const d = Object.getOwnPropertyDescriptor(
+              el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, "value");
+            d.set.call(el, before + chunk);
+            el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: chunk }));
+          }
+          await sleep(isCE(el) ? 30 : 15);
         }
-        await sleep(200);
+        await sleep(250);
         pressEnter(el);
         if (!(await waitBoxEmptied(el, 1500))) {
           const b2 = findSendButton();
@@ -328,9 +457,12 @@ if (!CFG) {
     }
     if (!submitted) {
       lbLog("ERROR", "MESSAGE NOT SUBMITTED — text still sits in the input box after every channel", { preview: readBox(el).trim().slice(0, 60), hidden: document.hidden });
-    } else {
-      lbLog("DEBUG", "message submitted (input box emptied)");
+      // v0.9: tell the orchestrator/engine explicitly so it can cool down and
+      // re-dispatch instead of us throwing a generic error mid-turn.
+      try { transport?.send({ type: "send_failed", agent: CFG.name, preview: readBox(el).trim().slice(0, 80) }); } catch {}
+      throw new Error("LLM Bridge: message not submitted");   // v0.8.2: FAIL LOUDLY
     }
+    lbLog("DEBUG", "message submitted (input box emptied)");
   }
 
   // Poll until the input box empties (= the site consumed the message) or timeout.
@@ -390,10 +522,21 @@ if (!CFG) {
     const t0 = Date.now();
     if (baseline < 0) baseline = assistantNodes().length;
     let delay = 60;                                   // quick initial poll…
+    // v0.8.2: the STOP-BUTTON signal alone is NOT proof of a new turn — qwen
+    // keeps one in the DOM between chats, so we "confirmed" starts that never
+    // happened and then captured the PREVIOUS reply (turns #4/#10/#11 in the
+    // user log returned byte-identical text seconds after a failed send).
+    // New rule: require either a genuinely NEW bubble, or an existing last
+    // bubble whose TEXT GREW after we saw the stop button.
+    let sawStop = false;
+    const lastLen = () => { const n = assistantNodes(); return n.length ? norm(n[n.length - 1].innerText ?? "").length : 0; };
+    const baseLen = lastLen();
     while (Date.now() - t0 < maxMs) {
-      if (document.querySelector(CFG.stop)) { lbLog("DEBUG", "generation started (stop button visible)", { ms: Date.now() - t0 }); return true; }
+      const nowStop = !!document.querySelector(CFG.stop);
+      if (nowStop) sawStop = true;
       const n = assistantNodes().length;
       if (n > baseline) { lbLog("DEBUG", "generation started (new assistant bubble appeared)", { ms: Date.now() - t0, bubbles: n }); return true; }
+      if (sawStop && lastLen() > baseLen + 20) { lbLog("DEBUG", "generation started (stop button + last bubble growing)", { ms: Date.now() - t0 }); return true; }
       await sleep(delay);
       delay = Math.min(delay * 1.5, 300);             // …then backs off gently
     }
@@ -454,9 +597,16 @@ if (!CFG) {
     return text;
   }
 
+  const norm = (s) => String(s).replace(/\s+/g, " ").trim().toLowerCase();
+
   function looksLikeChrome(t) {
     // short UI-vocabulary strings ("I prefer this response", "Copy", 👍 labels)
     if (CHROME_EXACT.test(t.trim())) return true;     // v0.8: "Thinking completed" etc.
+    // v0.8.2: qwen's error toast ("Oops! There was an issue connecting to…")
+    // and bare reasoning headers were relayed as full replies (user log
+    // 14:57/15:05). Treat them as chrome so the orchestrator retries the hop.
+    if (/^oops!?\b/i.test(t.trim()) || /was an issue connecting|service is currently exhausted|rate.?limit/i.test(t)) return true;
+    if (/^(thinking|deep thinking|analyzing)\b.{0,30}$/i.test(t.trim())) return true;
     return t.length < 60 && CHROME_HINT.test(t) && !/[.!?…]"']$/.test(t);
   }
   // v0.6 CONFIRM STEP — qwen's "which response do you prefer?" gate leaves a
@@ -491,8 +641,14 @@ if (!CFG) {
     return false;
   }
 
-  function lastAssistantText() {
-    const nodes = assistantNodes();
+  function lastAssistantText(baseline = -1) {
+    let nodes = assistantNodes();
+    // v0.8.3: FRESH-BUBBLE GUARANTEE. The user log showed byte-identical
+    // replies captured seconds after a FAILED send (turns #4/#10/#11 relayed
+    // the same 9364-char text). Bubbles can be re-rendered/reordered so the
+    // plain index cut misses; now we additionally require that the chosen
+    // bubble is NOT a known previous-turn text before accepting it.
+    if (baseline >= 0 && nodes.length > baseline) nodes = nodes.slice(baseline);
     lbLog("DEBUG", "scanning assistant bubbles", { candidates: nodes.length });
     for (let i = nodes.length - 1; i >= 0; i--) {
       let t = "";
@@ -501,10 +657,15 @@ if (!CFG) {
       if (t.startsWith("(no response")) { lbLog("WARN", "captured placeholder-looking bubble", { len: t.length }); continue; }
       // ECHO GUARD: never accept our own prompt back as a reply — this was the
       // single biggest desync source (the debate then loops on stale text).
-      const norm = (s) => s.replace(/\s+/g, " ").trim().toLowerCase();
       if (lastSentText && norm(t) === norm(lastSentText)) { lbLog("WARN", "skipped echoed prompt bubble", { chars: t.length }); continue; }
+      // v0.8.3: stale-reply guard — a bubble whose text equals the reply we
+      // ALREADY relayed last turn is not new; skipping it turns the phantom
+      // "byte-identical reply seconds after a failed send" into an honest
+      // "(no response captured)" that ask_robust retries instead of relaying.
+      if (lastCapturedNorm && norm(t) === lastCapturedNorm) { lbLog("WARN", "skipped stale previous-turn reply", { chars: t.length }); continue; }
       if (looksLikeChrome(t)) { lbLog("WARN", "skipped UI-chrome string", { preview: t.slice(0, 40) }); continue; }
       lbLog("INFO", "captured reply", { chars: t.length, preview: t.slice(0, 80) });
+      lastCapturedNorm = norm(t);                     // remember for next turn
       return t;
     }
     // Full diagnostic instead of a bare "(no response captured)":
@@ -564,7 +725,13 @@ if (!CFG) {
     state.halted = typeof force === "boolean" ? force : !state.halted;
     hudEl.querySelector(".lb-danger").classList.toggle("lb-on", state.halted);
     hud(state.halted ? "HALTED" : "idle");
-    try { chrome.runtime.sendMessage({ type: "halted", halted: state.halted }); } catch {}
+    if (transport?.mode === "ws") {
+      // v0.8.1: remote orchestrator needs an explicit frame — it holds ALL
+      // dispatch while any agent halts, so the debate can't keep typing into
+      // the other tab. In engine mode the runtime message below IS the engine.
+      try { sendCtl({ type: "halted", halted: state.halted }); } catch {}
+    }
+    try { chrome.runtime.sendMessage({ type: "halted", halted: state.halted, reason: "local" }); } catch {}
   }
   addEventListener("keydown", (e) => {              // Esc works even mid-flight
     if (e.key === "Escape") { e.stopPropagation(); toggleHalt(); }
@@ -588,8 +755,8 @@ if (!CFG) {
   //    ▶ button on ANY connected pill (or the popup's Start) fires it, carrying
   //    the saved popup Topic + Turns so the question you typed is honored. ────
   function sendCtl(obj) {
-    if (state.ws?.readyState === 1) { state.ws.send(JSON.stringify(obj)); return true; }
-    lbLog("WARN", "cannot " + obj.type + " — not connected to orchestrator yet"); return false;
+    if (transport?.alive()) { transport.send(obj); return true; }
+    lbLog("WARN", "cannot " + obj.type + " — no orchestrator transport is live yet"); return false;
   }
   function startSwarm() {
     chrome.storage.sync.get({ topic: "", turns: 6 }, (cfg) => {
@@ -601,69 +768,158 @@ if (!CFG) {
   }
   function stopSwarm() { if (sendCtl({ type: "stop" })) lbLog("INFO", "■ stop sent from HUD"); }
 
-  // ── Connection ─────────────────────────────────────────────────────────────
-  let backoff = 1000;
-  function connect() {
-    const ws = new WebSocket(WS_URL);
-    state.ws = ws;
-    hud("connecting…");
+  // ── Turn runner — shared by BOTH transports (v0.9) ───────────────────────
+  // Extracted from the old ws.onmessage so the in-browser engine can drive the
+  // exact same turn logic over chrome.runtime messages. Returns {queued:true}
+  // when a say arrives while a turn is still in flight (single-flight guard).
+  async function runTurn(text) {
+    const t0 = performance.now();
+    lbLog("INFO", `turn #${state.turns + 1}: received prompt`, { chars: String(text).length, preview: String(text).slice(0, 80) });
+    hud("writing…");
+    let textToSay = String(text);
+    let textP = "(no response captured)";
+    try {
+      for (;;) {
+        const baseline = assistantNodes().length;      // bubble count BEFORE send
+        await say(textToSay);
+        hud("thinking…");
+        await waitForStart(15000, baseline);           // stop button OR new bubble
+        await waitForIdle();
+        textP = await captureReply(baseline);          // + truncation re-check
+        if (textP !== "(no response captured)" || !pendingSay) break;
+        textToSay = pendingSay;                        // failed phantom turn — resend what we have queued
+        pendingSay = null;
+      }
+      state.turns++;
+      state.lastMs = performance.now() - t0;
+      lbLog("INFO", `turn #${state.turns} complete`, { seconds: +(state.lastMs / 1000).toFixed(1), replyChars: textP.length });
+      hud("idle");
+      transport?.send({ type: "reply", agent: CFG.name, text: textP });
+    } catch (e) {
+      lbLog("ERROR", "turn FAILED", { error: String(e), stack: String(e.stack).split("\n").slice(0, 3).join(" | ") });
+      hud("error");
+      transport?.send({ type: "error", agent: CFG.name, text: String(e) });
+    } finally {
+      busy = false;
+      if (pendingSay && !state.halted) {               // drain queued say after failure/idle capture
+        const q = pendingSay; pendingSay = null;
+        lbLog("INFO", "draining queued say", { chars: q.length });
+        handleOrchestratorFrame({ type: "say", text: q });
+      }
+    }
+  }
 
-    ws.onopen = () => {
-      backoff = 1000;                                 // reset on success
-      lbLog("INFO", "websocket connected → registering as " + CFG.name, { url: WS_URL });
-      ws.send(JSON.stringify({ type: "register", agent: CFG.name }));
+  function handleOrchestratorFrame(msg) {              // msg already parsed
+    if (msg.type === "clear_input") {                  // v0.8.3: flush a jammed editor before retrying
+      try {
+        const el = findInput();
+        if (el && readBox(el).trim()) {
+          setNativeValue(el, "");
+          if (isCE(el)) { try { document.execCommand("selectAll"); document.execCommand("delete"); } catch {} }
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
+          lbLog("INFO", "clear_input: flushed stuck text from input box", { chars: String(msg.text || "").length });
+        } else {
+          lbLog("DEBUG", "clear_input: box already empty");
+        }
+      } catch (e) { lbLog("WARN", "clear_input failed", { err: String(e).slice(0, 100) }); }
+      return;
+    }
+    if (msg.type === "registered") {                   // v0.9: engine acknowledged us
+      lbLog("INFO", "registered with in-browser swarm engine", { agent: msg.agent });
       hudEl.querySelector("#lb-start").hidden = false;
       hud("ready · press ▶");
-      try { chrome.runtime.sendMessage({ type: "agent-count" }); } catch {}
-    };
-
-    ws.onmessage = async (ev) => {
-      let msg; try { msg = JSON.parse(ev.data); } catch (e) { lbLog("ERROR", "bad frame from orchestrator (JSON parse)", { raw: String(ev.data).slice(0, 200), err: String(e) }); return; }
-      if (msg.type === "resume") { lbLog("INFO", "orchestrator mid-run — tab rejoined"); hud("thinking…"); return; }
-      if (msg.type === "swarm") {                      // armed/running/done mirror
-        state.swarm = msg.state;
-        hudEl.querySelector("#lb-start").hidden = msg.state !== "armed";
-        hudEl.querySelector("#lb-stop").hidden = msg.state !== "running";
-        if (msg.state === "armed") hud("ready · press ▶");
-        if (msg.state === "done") hud("idle");
-        return;
-      }
-      if (msg.type !== "say" || state.halted) { if (state.halted && msg.type === "say") lbLog("WARN", "dropping incoming say while HALTED", { preview: String(msg.text).slice(0, 60) }); return; }
-
-      const t0 = performance.now();
-      lbLog("INFO", `turn #${state.turns + 1}: received prompt`, { chars: String(msg.text).length, preview: String(msg.text).slice(0, 80) });
-      try {
-        hud("writing…");
-        const baseline = assistantNodes().length;     // bubble count BEFORE send
-        await say(msg.text);
-        hud("thinking…");
-        await waitForStart(15000, baseline);          // stop button OR new bubble
-        await waitForIdle();
-        const text = await captureReply(baseline);    // + truncation re-check
-        state.turns++;
-        state.lastMs = performance.now() - t0;
-        lbLog("INFO", `turn #${state.turns} complete`, { seconds: +(state.lastMs / 1000).toFixed(1), replyChars: text.length });
-        hud("idle");
-        ws.send(JSON.stringify({ type: "reply", agent: CFG.name, text }));
-      } catch (e) {
-        lbLog("ERROR", "turn FAILED", { error: String(e), stack: String(e.stack).split("\n").slice(0, 3).join(" | ") });
-        hud("error");
-        ws.send(JSON.stringify({ type: "error", agent: CFG.name, text: String(e) }));
-      }
-    };
-
-    ws.onclose = (ev) => { lbLog("WARN", `websocket closed (code ${ev.code}) — retrying in ${Math.round(backoff / 1000)}s`, { url: WS_URL });
-                           hud("connecting…"); setTimeout(connect, backoff);
-                           backoff = Math.min(backoff * 2, 15000); };
-    ws.onerror = () => ws.close();
+      return;
+    }
+    if (msg.type === "resume") { lbLog("INFO", "orchestrator mid-run — tab rejoined"); hud("thinking…"); return; }
+    if (msg.type === "swarm") {                        // armed/running/done mirror
+      state.swarm = msg.state;
+      hudEl.querySelector("#lb-start").hidden = msg.state !== "armed";
+      hudEl.querySelector("#lb-stop").hidden = msg.state !== "running";
+      if (msg.state === "armed") hud("ready · press ▶");
+      if (msg.state === "done") hud("idle");
+      if (msg.state === "halted" && !state.halted) hud("idle · halted elsewhere ⏸");
+      return;
+    }
+    if (msg.type === "engine-log") {                   // mirror engine lines into our ring buffer
+      const e = msg.entry || {};
+      LB_LOG.push({ ts: new Date(e.ts || Date.now()).toISOString().slice(11, -5), agent: "engine",
+                    level: e.level || "INFO", msg: e.msg || "", ...(e.data !== undefined ? { data: e.data } : {}) });
+      if (LB_LOG.length > 300) LB_LOG.shift();
+      return;
+    }
+    if (msg.type !== "say" || state.halted) { if (state.halted && msg.type === "say") lbLog("WARN", "dropping incoming say while HALTED", { preview: String(msg.text).slice(0, 60) }); return; }
+    if (busy) {                                        // v0.8.3: single-flight guard.
+      lbLog("WARN", "say arrived while a turn is still in flight — queueing behind it",
+            { preview: String(msg.text).slice(0, 40) });
+      pendingSay = String(msg.text);                   // keep only the newest; older dupes were the retry storm
+      return;
+    }
+    busy = true;
+    runTurn(msg.text);
   }
+
+  // ── Connection ─────────────────────────────────────────────────────────────
+  // v0.9: default transport is the in-browser swarm engine (python-free).
+  // If the user points us at a port AND enables remote mode, we use the
+  // classic WebSocket to orchestrator.py instead. Engine-first means zero
+  // localhost sockets unless explicitly asked for.
+  let backoff = 1000;
+  function connectEngineMode() {
+    setEngineTransport();
+    hud("connecting…");
+    transport.send({ type: "register", agent: CFG.name });
+    try { chrome.runtime.sendMessage({ type: "agent-count" }); } catch {}
+  }
+  function connect() {
+    chrome.storage.sync.get({ bridgeMode: "engine" }, ({ bridgeMode }) => {
+      if (bridgeMode === "engine") { connectEngineMode(); return; }
+      const ws = new WebSocket(WS_URL);
+      state.ws = ws;
+      setWsTransport(ws);
+      hud("connecting…");
+
+      ws.onopen = () => {
+        backoff = 1000;                                 // reset on success
+        lbLog("INFO", "websocket connected → registering as " + CFG.name, { url: WS_URL });
+        ws.send(JSON.stringify({ type: "register", agent: CFG.name }));
+        hudEl.querySelector("#lb-start").hidden = false;
+        hud("ready · press ▶");
+        try { chrome.runtime.sendMessage({ type: "agent-count" }); } catch {}
+      };
+
+      ws.onmessage = async (ev) => {
+        let msg; try { msg = JSON.parse(ev.data); } catch (e) { lbLog("ERROR", "bad frame from orchestrator (JSON parse)", { raw: String(ev.data).slice(0, 200), err: String(e) }); return; }
+        handleOrchestratorFrame(msg);
+      };
+
+      ws.onclose = (ev) => { lbLog("WARN", `websocket closed (code ${ev.code}) — retrying in ${Math.round(backoff / 1000)}s`, { url: WS_URL });
+                             hud("connecting…"); setTimeout(connect, backoff);
+                             backoff = Math.min(backoff * 2, 15000); };
+      ws.onerror = () => ws.close();
+    });
+  }
+
+  // v0.9: runtime message listener for engine-mode frames (chrome.runtime path)
+  try {
+    chrome.runtime.onMessage.addListener((m, _s, respond) => {
+      if (!m) return;
+      if (["say", "swarm", "clear_input", "registered", "resume", "engine-log"].includes(m.type)) {
+        handleOrchestratorFrame(m);
+        respond({ ok: true, queued: busy });
+        return true;
+      }
+      if (m?.type === "halted" && typeof m.halted === "boolean" && m.reason !== "local") {
+        toggleHalt(m.halted); respond({ ok: true }); return true;
+      }
+    });
+  } catch {}
 
   // ── Control deck asks: "how do you feel?" (popup tab-roster) ──────────────
   try {
     chrome.runtime.onMessage.addListener((m, _s, respond) => {
       if (m?.type === "status") respond({
         agent: CFG.name, state: state.lastState, turns: state.turns,
-        wsOpen: state.ws?.readyState === 1, halted: state.halted,
+        wsOpen: transport?.alive() ?? false, halted: state.halted, transport: transport?.mode || "none",
       });
       else if (m?.type === "halt") toggleHalt(!!m.halted);
       return true;

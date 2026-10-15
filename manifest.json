@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "LLM Bridge",
-  "version": "0.8.0",
-  "description": "Bridges two authenticated LLM web UIs into a self-driving conversation.",
+  "name": "Shoarma",
+  "version": "0.9.1",
+  "description": "Bridges two authenticated LLM web UIs into a self-driving conversation — fully browser-based.",
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Shoarma \u2014 LLM Bridge control deck",
+    "default_title": "Shoarma — LLM Bridge control deck",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
@@ -13,7 +13,7 @@
     }
   },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "swarm-engine.js"
   },
   "icons": {
     "16": "icons/icon16.png",
@@ -21,7 +21,7 @@
     "128": "icons/icon128.png"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* file:///*"
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*"
   },
   "content_scripts": [
     {
@@ -41,8 +41,7 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "hud.css",
-        "orchestrator.py"
+        "hud.css"
       ],
       "matches": [
         "https://chat.deepseek.com/*",
@@ -53,6 +52,10 @@
   "permissions": [
     "storage",
     "tabs",
-    "nativeMessaging"
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://chat.deepseek.com/*",
+    "https://chat.qwen.ai/*"
   ]
 }

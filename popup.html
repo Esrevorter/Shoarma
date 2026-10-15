@@ -27,13 +27,21 @@
     <p id="coach" class="coach">👋 Step 1 — open logged-in tabs of chat.deepseek.com and chat.qwen.ai. I'll tell you when both agents are wired.</p>
     <div class="progress"><div id="pbar" class="pbar" style="width:0%"></div></div>
     <p id="ptext" class="ptext"></p>
+    <label class="field mode-field">
+      <span>Orchestrator</span>
+      <select id="bridge-mode">
+        <option value="engine">🌐 In-browser engine (no Python needed)</option>
+        <option value="remote">🖥️ Remote orchestrator.py (ws://127.0.0.1)</option>
+      </select>
+    </label>
     <div class="row">
-      <button id="launch" class="big">🖥️ Start orchestrator</button>
+      <button id="launch" class="big">🚀 Launch swarm</button>
       <button id="start-run" class="big go" disabled>▶ Start swarm</button>
       <button id="stop-run" class="ghost side stop" hidden>■ Stop</button>
     </div>
     <div class="row">
       <button id="monitor" class="ghost side">📟 Open live monitor</button>
+      <button id="export" class="ghost side">⬇ Export transcript</button>
     </div>
     <p id="launch-hint" class="hint"></p>
   </section>
@@ -82,7 +90,7 @@
   </section>
 
   <footer>
-    <a id="install-link" href="#">⬇ Download orchestrator.py</a>
+    <a id="install-link" href="#">⬇ Download orchestrator.py (optional — remote mode)</a>
     <span>· read the <a href="https://github.com/Esrevorter/Shoarma/blob/main/README.md" target="_blank">README</a></span>
   </footer>
 

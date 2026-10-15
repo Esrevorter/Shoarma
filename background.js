@@ -1,37 +1,24 @@
-// background.js — Shoarma service worker.
-// Two jobs, both optional-granted:
-//   1. "launch" → spawn orchestrator.py via a native messaging host, so users
-//      never touch a terminal. If no native host is registered, we return a
-//      friendly per-OS message telling them the one-line setup instead.
-//   2. badge → show how many agent tabs are alive.
+// background.js — Shoarma service worker (v0.9: LEGACY COMPAT SHIM).
+// The orchestrator's former jobs moved to swarm-engine.js (the real MV3
+// service worker): agent dispatch, transcript persistence, and the in-browser
+// "python-free" swarm loop. This file is NOT referenced by manifest.json;
+// swarm-engine.js injects it on demand (chrome.scripting.registerContentScripts
+// is not usable for workers) ONLY when the user selects "Remote orchestrator.py"
+// mode, so the native-messaging launcher keeps working for headless users.
 
 const HOST = "com.shoarma.launcher";
 
-// v0.4: the live monitor page — a third tab where the whole swarm is visible
-// in real time (replies, agent states, debug stream), so users never have to
-// watch the terminal or alt-tab between chats.
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg?.type === "launch") { launch().then(respond); return true; }
-  if (msg?.type === "open-monitor") {
-    chrome.tabs.create({ url: chrome.runtime.getURL("monitor.html") });
-    respond({ ok: true }); return false;
-  }
   if (msg?.type === "log") {                           // bridge debug → console
     const e = msg.entry || {};
     (e.level === "ERROR" ? console.warn : console.log)(`[Shoarma ${e.agent}] ${e.level}: ${e.msg}`, e.data ?? "");
     respond({ ok: true }); return false;
   }
-  if (msg?.type === "agent-count") {                 // bridge pings us on connect
-    bumpBadge(sender.tab?.id);
-    respond({ ok: true });
-    return false;
-  }
   // ── v0.8: tab activation ────────────────────────────────────────────────
   // Sites throttle background tabs (React timers, input handlers, even the
   // WebSocket), so before every say()/confirm() the bridge asks US to bring
   // its own tab to the foreground — fully automated, no user interaction.
-  // chrome.tabs.update(tab.id, {active:true}) activates the tab AND focuses
-  // its window. We debounce per-tab so rapid-fire requests don't thrash.
   if (msg?.type === "activate-tab") {
     const tabId = sender.tab?.id;
     if (tabId == null) { respond({ ok: false, error: "no tab" }); return false; }

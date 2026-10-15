@@ -8,6 +8,15 @@ import argparse, asyncio, json, logging, os, time
 from pathlib import Path
 
 AGENTS_EXPECTED = {"qwen", "deepseek"}
+
+# Windows terminals default to cp1252 and crash on emoji like 📟 — force UTF-8
+# output where possible, degrade gracefully where they don't allow it.
+try:
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 HOST = "127.0.0.1"
 
 # built-in fallbacks; overridden by ./settings.json if present
@@ -30,7 +39,13 @@ def load_settings() -> dict:
 
 
 def emit(line: str, hub=None):
-    print(line, flush=True)   # flushed so `tee` / the launcher pipe stay live
+    # Windows cp1252 consoles crash on emoji (📟 etc.) — strip to ASCII for the
+    # terminal only; the monitor feed and log files keep the original text.
+    try:
+        printable = line.encode("ascii", "ignore").decode()
+    except Exception:
+        printable = line
+    print(printable or line, flush=True)   # flushed so `tee`/launcher pipes stay live
     if hub is not None:
         hub.add({"type": "sys", "text": line})
 
@@ -80,14 +95,24 @@ async def http_side_server(hub: Hub, path: Path):
         except Exception: pass
     srv = await asyncio.start_server(handle, HOST, 0)     # ephemeral OS port
     port = srv.sockets[0].getsockname()[1]
-    (path.parent / "monitor-port.txt").write_text(str(port))
+    write_utf8(path.parent / "monitor-port.txt", str(port))
     return srv, port
+
+
+def write_utf8(path: Path, text: str):
+    """Windows' default cp1252 encoding chokes on emoji (🔄 etc.) — always
+    write our own files as UTF-8 explicitly, and never let a failed write
+    kill a finished run."""
+    try:
+        path.write_text(text, encoding="utf-8")
+    except Exception as e:
+        print(f"[warn] could not write {path.name}: {e!r}", flush=True)
 
 
 def log_turn(entry: dict, transcript: list, path: Path):
     transcript.append(entry)
     # stream as we go so a crash mid-run still leaves usable data
-    path.write_text(json.dumps(transcript, indent=2))
+    write_utf8(path, json.dumps(transcript, indent=2, ensure_ascii=False))
 
 
 async def handler(ws, agents: dict, pending: dict, hub: Hub):
@@ -161,19 +186,19 @@ async def main():
 
     side_srv, http_port = await http_side_server(hub, log_path)
     try:                                   # also publish the WS port so the
-        (run_dir / "ws-port.txt").write_text(str(args.port))  # extension can find us on custom ports
+        write_utf8(run_dir / "ws-port.txt", str(args.port))  # extension can find us on custom ports
     except Exception:
         pass
     try:                                   # fallback location the monitor probes
         Path("/tmp/shoarma").mkdir(exist_ok=True)
-        Path("/tmp/shoarma/monitor-port.txt").write_text(str(http_port))
-        Path("/tmp/shoarma/ws-port.txt").write_text(str(args.port))
+        write_utf8(Path("/tmp/shoarma/monitor-port.txt"), str(http_port))
+        write_utf8(Path("/tmp/shoarma/ws-port.txt"), str(args.port))
     except OSError:
         pass
     async with __import__("websockets").serve(
             lambda ws: handler(ws, agents, pending, hub), HOST, args.port):
         emit(f"ws://{HOST}:{args.port} — open both tabs, waiting for {sorted(AGENTS_EXPECTED)}", hub)
-        emit(f"📟 live monitor feed: http://127.0.0.1:{http_port}/state  (open the Shoarma Monitor tab)", hub)
+        emit(f"live monitor feed: http://127.0.0.1:{http_port}/state  (open the Shoarma Monitor tab)", hub)
         while not AGENTS_EXPECTED.issubset(agents):
             await asyncio.sleep(0.3)          # snappier readiness detection
         emit("both agents online. starting.\n", hub)
@@ -210,8 +235,10 @@ async def main():
 
         if not aborted:
             emit(f"\nsaved {len(transcript)} turns → {out_path}", hub)
-        log_path.write_text("\n".join(t["text"] for t in transcript) or "(empty)")
-        debug_path.write_text("\n".join(
+        else:
+            emit(f"partial transcript saved → {out_path}", hub)
+        write_utf8(log_path, "\n".join(t["text"] for t in transcript) or "(empty)")
+        write_utf8(debug_path, "\n".join(
             f"{e['ts']} {e.get('level','SYS').upper():5} [{e.get('agent','orch')}] "
             f"{e.get('msg') or e.get('text','')}"
             + (f" :: {json.dumps(e['data'])[:300]}" if e.get("data") else "")
@@ -222,4 +249,11 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        # e.g. agents disconnected when their tabs closed right at run end —
+        # the transcript is already streamed to disk, so report and exit clean.
+        print(f"[shoarma] run ended: {e!r}", flush=True)

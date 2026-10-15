@@ -1,6 +1,7 @@
 // bridge.js — one instance per LLM tab. Each instance = one agent node.
-// v0.4: debug ring buffer + copyable diagnostics, live feed to monitor page,
-//       stricter assistant-bubble matching, mid-stream liveness check.
+// v0.5: echo guard (never read our own prompt back), shadow-DOM bubble walk,
+//       UI-chrome filter ("I prefer this response"), new-bubble start signal,
+//       truncated-reply re-check. Debug ring buffer + monitor feed from v0.4.
 
 let WS_URL = "ws://127.0.0.1:8765";   // re-derived from the saved port below
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -85,25 +86,58 @@ if (!CFG) {
     el.dispatchEvent(new Event("input", { bubbles: true }));
   }
 
-  // ── Bubble matching. The old selectors also hit USER bubbles (generic
-  // .markdown-body exists in both) → we sometimes read back our own prompt
-  // ("decoding errors"), and when neither matched → "(no response captured)".
-  // Now: candidate nodes are filtered by ancestor role/class, never user-owned.
-  const BUBBLE_CANDIDATES = '[data-role="assistant"], [data-message-author-role="assistant"], [class*="assistant"] [class*="content"], [class*="reply-content"], [class*="markdown"]';
+  // ── Bubble matching (v0.5). Three failure modes fixed at once:
+  //   1. ECHOING — generic selectors ([class*="markdown"]) also match the USER
+  //      bubble, so we read our own prompt back as "the reply". The site marks
+  //      every message row with data-turn-role="user"/"assistant": bail out of
+  //      that subtree immediately. Also reject text identical to the prompt we
+  //      just sent (last-resort guard even if DOM attributes change again).
+  //   2. MISREAD — UI chrome ("I prefer this response", thumbs, copy buttons)
+  //      lives inside markdown-ish containers → filter short strings that don't
+  //      end like sentences and contain preference/vote vocabulary.
+  //   3. NO CAPTURE — qwen renders replies in shadow-DOM islands, so a plain
+  //      querySelectorAll sees nothing → walk open shadow roots too.
+  const BUBBLE_CANDIDATES = '[data-role="assistant"], [data-message-author-role="assistant"], [data-turn-role="assistant"], [class*="assistant"] [class*="content"], [class*="reply-content"], [class*="markdown"]';
   const USER_HINT = /user|human|question|query|prompt/i;
-  function isAssistantBubble(el) {
-    for (let n = el, d = 0; n && d < 8; n = n.parentElement, d++) {
-      const id = `${n.className} ${n.id} ${n.getAttribute?.("data-role") ?? ""} ${n.getAttribute?.("data-message-author-role") ?? ""}`;
-      if (/assistant|answer|model|bot|response|reply/i.test(id)) return true;
-      if (USER_HINT.test(id)) return false;
+  const CHROME_HINT = /prefer this|thumbs|good response|bad response|copy|regenerate|like|dislike/i;
+  let lastSentText = "";
+
+  function isInsideUserTurn(el) {
+    for (let n = el, d = 0; n && d < 12; n = n.parentElement, d++) {
+      if (n.getAttribute?.("data-turn-role") === "user") return true;
     }
     return false;
   }
+  function isAssistantBubble(el) {
+    if (isInsideUserTurn(el)) return false;         // decisive per-site marker
+    for (let n = el, d = 0; n && d < 8; n = n.parentElement, d++) {
+      if (n === document.body) break;               // stop climbing into page chrome
+      const attrs = `${n.className} ${n.id} ${n.getAttribute?.("data-role") ?? ""} ${n.getAttribute?.("data-message-author-role") ?? ""} ${n.getAttribute?.("data-turn-role") ?? ""}`;
+      if (/assistant|answer|model|bot|response|reply/i.test(attrs)) return true;
+      if (USER_HINT.test(attrs)) return false;
+    }
+    return false;
+  }
+  // Collect candidates across light DOM AND every open shadow root (qwen's
+  // reply markup hides behind Shadow DOM; a flat querySelectorAll misses it).
+  function collectCandidates(root, out, depth) {
+    if (depth > 6) return out;
+    try { out.push(...root.querySelectorAll(BUBBLE_CANDIDATES)); } catch {}
+    for (const host of root.querySelectorAll("*")) {
+      if (host.shadowRoot) collectCandidates(host.shadowRoot, out, depth + 1);
+    }
+    return out;
+  }
   function assistantNodes() {
-    return [...document.querySelectorAll(BUBBLE_CANDIDATES)].filter(isAssistantBubble);
+    // dedupe: a bubble container and its inner markdown div can BOTH match the
+    // selector list — keep only nodes no other match contains, so text isn't
+    // read twice (and the "last" node is always an outermost, complete bubble).
+    const all = collectCandidates(document, [], 0).filter(isAssistantBubble);
+    return all.filter(n => !all.some(m => m !== n && m.contains(n)));
   }
 
   async function say(text) {
+    lastSentText = text.trim();                       // for the echo guard below
     lbLog("INFO", "say: typing into input", { chars: text.length, preview: text.slice(0, 60) });
     const el = document.querySelector(CFG.input);
     if (!el) { lbLog("ERROR", "input NOT FOUND", { selector: CFG.input, hint: "site DOM changed — update SITES.input" }); throw new Error("LLM Bridge: input not found"); }
@@ -122,18 +156,25 @@ if (!CFG) {
   }
 
   // Wait for generation to actually START. Without this you read the PREVIOUS
-  // reply and the whole loop silently desynchronizes. Polls fast at first —
-  // the stop button usually appears within ~1s of hitting Send.
-  async function waitForStart(maxMs = 6000) {
+  // reply and the whole loop silently desynchronizes. Two signals, either one
+  // counts: (a) the stop button appears, or (b) a NEW assistant bubble appeared
+  // (bubble count grew past `baseline`). Qwen's UI often has no aria-label Stop
+  // button at all — with only signal (a) we waited 6s every hop and then raced
+  // the stream; that caused both the slowness AND truncated captures like
+  // "It appears your chat interface is caught in".
+  async function waitForStart(maxMs = 15000, baseline = -1) {
     const t0 = Date.now();
+    if (baseline < 0) baseline = assistantNodes().length;
     let delay = 60;                                   // quick initial poll…
     while (Date.now() - t0 < maxMs) {
       if (document.querySelector(CFG.stop)) { lbLog("DEBUG", "generation started (stop button visible)", { ms: Date.now() - t0 }); return true; }
+      const n = assistantNodes().length;
+      if (n > baseline) { lbLog("DEBUG", "generation started (new assistant bubble appeared)", { ms: Date.now() - t0, bubbles: n }); return true; }
       await sleep(delay);
       delay = Math.min(delay * 1.5, 300);             // …then backs off gently
     }
-    lbLog("WARN", "no stop button seen within " + maxMs + "ms — proceeding anyway",
-          { stopSel: CFG.stop, matches: document.querySelectorAll(CFG.stop).length });
+    lbLog("WARN", "no start signal within " + maxMs + "ms — proceeding anyway",
+          { stopSel: CFG.stop, matches: document.querySelectorAll(CFG.stop).length, baseline, now: assistantNodes().length });
     return false; // some UIs have no stop button — proceed anyway
   }
 
@@ -161,21 +202,50 @@ if (!CFG) {
     });
   }
 
+  // ── Liveness check (v0.5): if the first capture looks TRUNCATED (no ending
+  // punctuation, suspiciously short given we just waited a full settle window),
+  // give the stream one more chance to finish before accepting it. Prevents
+  // sentences like "It appears your chat interface is caught in" from being
+  // relayed as if complete. Max one extra pass per turn — never loops. ────────
+  function looksTruncated(t) {
+    if (!t || t === "(no response captured)") return false;
+    return t.length < 400 && !/[.!?…:;"'\)\]»”’]$/.test(t.trim());
+  }
+  async function captureReply(baseline) {
+    let text = lastAssistantText(baseline);
+    if (looksTruncated(text)) {
+      lbLog("INFO", "reply looks truncated — waiting one more settle window", { chars: text.length });
+      await waitForIdle({ quietMs: 1200, timeoutMs: 30000 });
+      const again = lastAssistantText(baseline);
+      if (again.length > text.length) { lbLog("INFO", "longer capture after liveness re-check", { was: text.length, now: again.length }); text = again; }
+    }
+    return text;
+  }
+
+  function looksLikeChrome(t) {
+    // short UI-vocabulary strings ("I prefer this response", "Copy", 👍 labels)
+    return t.length < 60 && CHROME_HINT.test(t) && !/[.!?…]"']$/.test(t);
+  }
   function lastAssistantText() {
     const nodes = assistantNodes();
     lbLog("DEBUG", "scanning assistant bubbles", { candidates: nodes.length });
     for (let i = nodes.length - 1; i >= 0; i--) {
-      const t = (nodes[i].innerText || "").trim();
-      if (t) {
-        if (t.startsWith("(no response")) { lbLog("WARN", "captured placeholder-looking bubble", { len: t.length }); continue; }
-        lbLog("INFO", "captured reply", { chars: t.length, preview: t.slice(0, 80) });
-        return t;
-      }
+      let t = "";
+      try { t = (nodes[i].innerText ?? nodes[i].textContent ?? "").trim(); } catch {}
+      if (!t) continue;
+      if (t.startsWith("(no response")) { lbLog("WARN", "captured placeholder-looking bubble", { len: t.length }); continue; }
+      // ECHO GUARD: never accept our own prompt back as a reply — this was the
+      // single biggest desync source (the debate then loops on stale text).
+      const norm = (s) => s.replace(/\s+/g, " ").trim().toLowerCase();
+      if (lastSentText && norm(t) === norm(lastSentText)) { lbLog("WARN", "skipped echoed prompt bubble", { chars: t.length }); continue; }
+      if (looksLikeChrome(t)) { lbLog("WARN", "skipped UI-chrome string", { preview: t.slice(0, 40) }); continue; }
+      lbLog("INFO", "captured reply", { chars: t.length, preview: t.slice(0, 80) });
+      return t;
     }
     // Full diagnostic instead of a bare "(no response captured)":
     lbLog("ERROR", "NO RESPONSE CAPTURED", {
       bubbleSel: BUBBLE_CANDIDATES,
-      totalMatches: document.querySelectorAll(BUBBLE_CANDIDATES).length,
+      totalMatches: collectCandidates(document, [], 0).length,
       passedAssistantFilter: nodes.length,
       sampleClasses: [...document.querySelectorAll(BUBBLE_CANDIDATES)].slice(-4)
         .map(n => (n.parentElement?.className || "?").toString().slice(0, 70)),
@@ -268,11 +338,12 @@ if (!CFG) {
       lbLog("INFO", `turn #${state.turns + 1}: received prompt`, { chars: String(msg.text).length, preview: String(msg.text).slice(0, 80) });
       try {
         hud("writing…");
+        const baseline = assistantNodes().length;     // bubble count BEFORE send
         await say(msg.text);
         hud("thinking…");
-        await waitForStart();
+        await waitForStart(15000, baseline);          // stop button OR new bubble
         await waitForIdle();
-        const text = lastAssistantText();
+        const text = await captureReply(baseline);    // + truncation re-check
         state.turns++;
         state.lastMs = performance.now() - t0;
         lbLog("INFO", `turn #${state.turns} complete`, { seconds: +(state.lastMs / 1000).toFixed(1), replyChars: text.length });

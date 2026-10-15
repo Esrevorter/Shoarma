@@ -163,6 +163,12 @@ The popup badge number = how many agent tabs are alive. If it says `0/2 agent(s)
 
 **v0.4 — you don't even have to watch the tabs.** Hit **📟 Open live monitor** in the popup: a third tab streams the entire conversation as it happens (speaker-colored turns, per-agent state, timings), with a debug toggle and a one-click **📋 Copy debug** dump for bug reports. The orchestrator runs quietly in the background; its feed stays readable for 60s after the last turn.
 
+**v0.5 — capture hardening (the "no response captured" + echo release).** Real-world runs exposed three failure modes, all fixed:
+- **Echo guard** — the bridge could read its *own prompt* back out of the user bubble (generic `[class*="markdown"]` selectors match both sides), desyncing the whole debate into an echo loop. Bubbles inside `data-turn-role="user"` subtrees are now rejected outright, and any capture identical to the text we just sent is skipped.
+- **Shadow-DOM walk** — Qwen renders replies inside shadow roots that a flat `querySelectorAll` never sees (`totalMatches: 0`). Candidate scanning now recurses through open shadow roots, and nested double-matches are deduped so text isn't read twice.
+- **Chrome filter + liveness re-check** — UI strings like *"I prefer this response"* are no longer mistaken for replies, and truncated captures (a sentence cut mid-stream) get one extra settle-window pass before being accepted. Generation-start detection also triggers on *new assistant bubble appeared*, not just the Stop button (Qwen has none) — removing a guaranteed 6 s stall per hop.
+- **Windows-proof referee** — transcripts/logs are written UTF-8 explicitly (the old cp1252 crash killed the process *after* a successful run), console output strips emoji safely, and closing tabs at run end no longer dumps a traceback.
+
 ---
 
 ## 🤖 CI & packaged builds

@@ -565,6 +565,9 @@ if (!CFG) {
     hudEl.querySelector(".lb-danger").classList.toggle("lb-on", state.halted);
     hud(state.halted ? "HALTED" : "idle");
     try { chrome.runtime.sendMessage({ type: "halted", halted: state.halted }); } catch {}
+    // v0.8.1: tell the orchestrator too — it now holds ALL dispatch while any
+    // agent halts, so the debate can't keep typing into the other tab.
+    try { sendCtl({ type: "halted", halted: state.halted }); } catch {}
   }
   addEventListener("keydown", (e) => {              // Esc works even mid-flight
     if (e.key === "Escape") { e.stopPropagation(); toggleHalt(); }
@@ -626,6 +629,7 @@ if (!CFG) {
         hudEl.querySelector("#lb-stop").hidden = msg.state !== "running";
         if (msg.state === "armed") hud("ready · press ▶");
         if (msg.state === "done") hud("idle");
+        if (msg.state === "halted" && !state.halted) hud("idle · halted elsewhere ⏸");
         return;
       }
       if (msg.type !== "say" || state.halted) { if (state.halted && msg.type === "say") lbLog("WARN", "dropping incoming say while HALTED", { preview: String(msg.text).slice(0, 60) }); return; }

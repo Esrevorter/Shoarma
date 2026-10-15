@@ -42,6 +42,18 @@ document.addEventListener("DOMContentLoaded", async () => {
         halted: $("halted").checked,
       };
       await chrome.storage.sync.set(next);
+      // v0.8.1: the "halted" checkbox previously only wrote storage — bridge.js
+      // reacts to the sync change, but the orchestrator knew nothing at all and
+      // kept typing into the *other* tab. Push the halt to the swarm directly;
+      // the orchestrator now holds ALL dispatch while halted and mirrors the
+      // state to every HUD pill + the monitor feed.
+      if (next.halted !== undefined) {
+        if (ctlWs?.readyState === 1) {
+          ctlWs.send(JSON.stringify({ type: "halted", halted: next.halted }));
+        } else {
+          act("⚠ halt toggled but orchestrator WS not connected — tabs pause, swarm router does not");
+        }
+      }
       flash("Saved ✓ — open tabs update instantly.");
       act(`settings saved: turns=${next.turns} timeout=${next.timeout}s port=${next.port}`);
     }, 250);

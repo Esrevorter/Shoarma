@@ -10,7 +10,15 @@
 #       from the popup travels with that start frame (the old auto-start was
 #       why the HUD question was silently ignored). The opening prompt is
 #       wrapped so debaters never receive a bare "(no response captured)".
-# pip install websockets
+# v0.8.1 COMPATIBILITY + ROBUSTNESS:
+#       - works with websockets >= 13 / >= 15 (new asyncio implementation),
+#         which broke the old positional (path, request) process_request hook
+#         and reject single-arg legacy handlers; we adapt automatically.
+#       - per-hop failures are isolated: one agent's timeout/disconnect costs
+#         at most its own hop instead of aborting the whole run.
+#       - HALT is enforced centrally too: while halted, say() waits until the
+#         halt is lifted, so no tab can be typed into mid-pause.
+# pip install websockets>=12
 
 import argparse, asyncio, json, logging, os, time
 from pathlib import Path
@@ -166,8 +174,18 @@ def make_process_request(hub_ref: dict):
         import base64
         return base64.b64encode(_body_bytes(f"{code} {reason}", body, ctype)).decode()
 
-    async def process_request(connection, request):
-        p = getattr(request, "path", "") or ""
+    def process_request(*args):
+        # v0.8.1: adapt to BOTH websockets generations.
+        #   legacy (<13, asyncio impl):  process_request(path, request_headers)
+        #   new (>=13/15, asyncio impl): process_request(connection, request)
+        # The old positional signature silently stopped matching /state on
+        # websockets >= 15 (request is an object there, `p` became ""), which
+        # broke monitor discovery for anyone on a fresh `pip install`.
+        a0, a1 = (args + (None,))[:2]
+        if isinstance(a0, str):                      # legacy: path, headers
+            p = a0
+        else:                                        # new: connection, request
+            p = getattr(a1, "path", "") or ""
         if p.startswith("/state"):
             fp = hub_ref.get("feed_port")
             return _make_response(200, "OK",
@@ -179,6 +197,50 @@ def make_process_request(hub_ref: dict):
                 return _make_response(200, "OK", str(fp).encode(), "text/plain")
         return None          # everything else → normal WebSocket handshake
     return process_request
+
+
+def serve_swarm(ctx, hub_ref, host, port):
+    """v0.8.1: version-adaptive websockets.serve() factory.
+
+    ctx = {"handler": handler_fn, "agents":…, "pending":…, "hub":…, "control":…}
+    Depending on the installed websockets generation we must present the
+    connection handler and the /state hook with different call signatures:
+
+      * legacy asyncio impl (websockets ≤ 12): handler called as
+        handler(ws, path); process_request(path, headers), base64 response.
+      * new asyncio impl (websockets ≥ 13/15+): handler called as
+        handler(connection); process_request(connection, request) returning a
+        websockets.http11.Response (or None).
+
+    We probe the API surface instead of guessing from version strings."""
+    import websockets
+
+    # Does this build still ship the legacy server protocol (≤13)?
+    try:
+        from websockets.legacy.server import WebSocketServerProtocol  # noqa: F401
+        legacy = True
+    except ImportError:
+        legacy = False
+
+    pr = make_process_request(hub_ref)
+
+    if legacy:
+        def pr_legacy(path, headers, _pr=pr):          # positional (path, headers)
+            return _pr(path, headers)
+        async def conn_handler(ws, path=None):         # legacy calls handler(ws, path)
+            await ctx["handler"](ws, ctx["agents"], ctx["pending"],
+                                 ctx["hub"], ctx["control"])
+        return websockets.serve(conn_handler, host, port, process_request=pr_legacy)
+
+    # new API: single-arg handler; process_request(connection, request)
+    async def conn_handler(connection):
+        await ctx["handler"](connection, ctx["agents"], ctx["pending"],
+                             ctx["hub"], ctx["control"])
+
+    async def pr_async(connection, request, _pr=pr):
+        return _pr(connection, request)
+
+    return websockets.serve(conn_handler, host, port, process_request=pr_async)
 
 
 def write_utf8(path: Path, text: str):
@@ -226,6 +288,15 @@ async def handler(ws, agents: dict, pending: dict, hub: Hub, control: dict):
             elif msg["type"] == "stop":
                 control["stop_flag"] = True
                 emit(f"■ stop received from {name}", hub)
+            elif msg["type"] == "halted":              # v0.8.1: central HALT mirror
+                h = bool(msg.get("halted"))
+                if h != control.get("halted"):
+                    control["halted"] = h
+                    hub.agent("_swarm", state="halted" if h else control.get("phase", "armed"))
+                    emit(("⏸ halt engaged — swarm dispatch paused" if h
+                          else "▶ halt released — swarm resumes"), hub)
+                    await hub.broadcast({"type": "swarm",
+                                         "state": "halted" if h else control["phase"]})
             elif msg["type"] == "log":                     # agent debug frame
                 hub.add({"type": "log", "agent": msg.get("agent", name),
                          "level": msg.get("level", "INFO"), "msg": str(msg.get("msg", ""))[:300],
@@ -251,7 +322,21 @@ async def handler(ws, agents: dict, pending: dict, hub: Hub, control: dict):
             emit(f"[-] node offline: {name}", hub)
 
 
-async def ask(agents: dict, pending: dict, hub: Hub, agent: str, text: str, timeout: int) -> str:
+async def ask(agents: dict, pending: dict, hub: Hub, agent: str, text: str,
+              timeout: int, control: dict | None = None) -> str:
+    # v0.8.1: HALT is enforced centrally too. Previously a tab that was NOT
+    # halted kept getting typed into while its partner sat paused — the debate
+    # continued one-sidedly. Now say() waits until every agent reports itself
+    # unhalted (or the halt is lifted) before dispatching a hop.
+    if control is not None:
+        waited = 0
+        while control.get("halted") and waited < 300:
+            if waited == 0:
+                emit("⏸ swarm halted — holding dispatch until resume", hub)
+            await asyncio.sleep(1)
+            waited += 1
+        if waited >= 300:
+            raise TimeoutError("halt held for 5 minutes — run aborted safely")
     fut = asyncio.get_running_loop().create_future()
     pending[agent] = fut
     hub.agent(agent, state="writing")
@@ -292,10 +377,32 @@ def looks_junk(t):
             or any(j.lower() in tl for j in CAPTURE_JUNK))
 
 
-async def ask_robust(agents, pending, hub, agent, text, timeout, retries=1):
-    """ask() + capture validation. Returns (text, ok)."""
+async def ask_robust(agents, pending, hub, agent, text, timeout, retries=1, control=None):
+    """ask() + capture validation. Returns (text, ok).
+    v0.8.1: per-hop fault isolation — a timeout or a disconnected tab no longer
+    aborts the whole run; we substitute RETRY_NOTE and give the next hop a
+    chance to recover (a reloaded tab re-registers and resumes its slot)."""
     for attempt in range(retries + 1):
-        got = await ask(agents, pending, hub, agent, text, timeout)
+        try:
+            got = await ask(agents, pending, hub, agent, text, timeout, control)
+        except asyncio.TimeoutError:
+            hub.add({"type": "log", "agent": agent, "level": "WARN",
+                     "msg": f"hop timed out after {timeout}s (attempt {attempt + 1})"})
+            emit(f"[{agent}] hop timed out — retrying this hop…", hub)
+            continue
+        except ConnectionError as e:
+            hub.add({"type": "log", "agent": agent, "level": "WARN",
+                     "msg": f"agent offline mid-hop: {e}"})
+            emit(f"[{agent}] went offline mid-hop — waiting for rejoin…", hub)
+            # give a reloading tab time to re-register before giving up on it
+            for _ in range(int(min(timeout, 60))):
+                if agent in agents:
+                    break
+                await asyncio.sleep(1)
+            if agent not in agents:
+                emit(f"[{agent}] still offline — skipping this hop", hub)
+                return RETRY_NOTE, False
+            continue
         if not looks_junk(got):
             return got, True
         hub.add({"type": "log", "agent": agent, "level": "WARN",
@@ -328,7 +435,7 @@ async def main():
     transcript: list[dict] = []
     control = {"start_evt": asyncio.get_running_loop().create_future(),
                "topic": None, "turns": args.turns, "running": False,
-               "stop_flag": False, "phase": "waiting"}
+               "stop_flag": False, "phase": "waiting", "halted": False}
 
     run_dir = Path(os.environ.get("SHOARMA_HOME", "."))
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -345,6 +452,8 @@ async def main():
 
     side_srv, http_port = await http_side_server(hub, log_path)
     hub_ref = {"hub": hub, "feed_port": http_port}     # shared with WS-port HTTP
+    ctx = {"handler": handler, "agents": agents, "pending": pending,
+           "hub": hub, "control": control}             # v0.8.1 serve_swarm context
     try:                                   # also publish the WS port so the
         write_utf8(run_dir / "ws-port.txt", str(args.port))  # extension can find us on custom ports
     except Exception:
@@ -355,9 +464,7 @@ async def main():
         write_utf8(Path("/tmp/shoarma/ws-port.txt"), str(args.port))
     except OSError:
         pass
-    async with __import__("websockets").serve(
-            lambda ws: handler(ws, agents, pending, hub, control), HOST, args.port,
-            process_request=make_process_request(hub_ref)):
+    async with serve_swarm(ctx, hub_ref, HOST, args.port):
         emit(f"ws://{HOST}:{args.port} — open both tabs, waiting for {sorted(AGENTS_EXPECTED)}", hub)
         emit(f"live monitor feed: http://127.0.0.1:{http_port}/state  "
              f"(also served directly on http://127.0.0.1:{args.port}/state)", hub)
@@ -397,14 +504,14 @@ async def main():
                 # instant the previous reply lands (no polling gaps).
                 a, b = order if turn % 2 else order[::-1]
                 t0 = time.monotonic()
-                ra, ok_a = await ask_robust(agents, pending, hub, a, msg, args.timeout)
+                ra, ok_a = await ask_robust(agents, pending, hub, a, msg, args.timeout, control=control)
                 mid = time.monotonic() - t0
                 log_turn({"turn": turn, "agent": a, "seconds": round(mid, 1),
                           "text": ra, "captured": ok_a}, transcript, out_path)
                 hub.add({"type": "reply", "agent": a, "turn": turn,
                          "seconds": round(mid, 1), "text": ra})
                 emit(f"<<< {a}: {ra[:400]}", hub)
-                rb, ok_b = await ask_robust(agents, pending, hub, b, ra, args.timeout)
+                rb, ok_b = await ask_robust(agents, pending, hub, b, ra, args.timeout, control=control)
                 tot = time.monotonic() - t0
                 log_turn({"turn": turn, "agent": b, "seconds": round(tot - mid, 1),
                           "text": rb, "captured": ok_b}, transcript, out_path)

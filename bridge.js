@@ -1,4 +1,6 @@
 // bridge.js — one instance per LLM tab. Each instance = one agent node.
+// v0.2: faster cadence, event-driven generation detection, sleek glass HUD,
+//       keyboard HALT (Esc), live turn stats, minimal reconnect backoff.
 
 const WS_URL = "ws://127.0.0.1:8765";
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -27,7 +29,7 @@ if (!CFG) {
   // Defensive: content script injected on a host we don't know how to drive.
   console.warn("LLM Bridge: no site config for", location.hostname);
 } else {
-  const state = { halted: false, ws: null };
+  const state = { halted: false, ws: null, turns: 0, lastMs: 0 };
 
   // ── The single most important function in this entire project ──────────────
   // These are React apps. Setting el.value = "..." does NOTHING — React's
@@ -46,7 +48,7 @@ if (!CFG) {
     if (!el) throw new Error("LLM Bridge: input not found");
     el.focus();
     setNativeValue(el, text);
-    await sleep(200 + Math.random() * 300);          // human-ish cadence
+    await sleep(90 + Math.random() * 140);           // human-ish but snappy
     const btn = document.querySelector(CFG.send);
     if (btn && !btn.disabled) {
       btn.click();
@@ -57,29 +59,35 @@ if (!CFG) {
   }
 
   // Wait for generation to actually START. Without this you read the PREVIOUS
-  // reply and the whole loop silently desynchronizes.
-  async function waitForStart(maxMs = 8000) {
+  // reply and the whole loop silently desynchronizes. Polls fast at first —
+  // the stop button usually appears within ~1s of hitting Send.
+  async function waitForStart(maxMs = 6000) {
     const t0 = Date.now();
+    let delay = 60;                                   // quick initial poll…
     while (Date.now() - t0 < maxMs) {
       if (document.querySelector(CFG.stop)) return true;
-      await sleep(200);
+      await sleep(delay);
+      delay = Math.min(delay * 1.5, 300);             // …then backs off gently
     }
     return false; // some UIs have no stop button — proceed anyway
   }
 
-  // Wait for generation to FINISH: debounce on DOM mutations.
-  // More reliable than waiting for a "Copy" button, which may not exist.
-  function waitForIdle({ quietMs = 1600, timeoutMs = 120000 } = {}) {
+  // Wait for generation to FINISH: debounce on DOM mutations, scoped to the
+  // chat container when possible (body-wide observers fire on every unrelated
+  // re-render). quietMs is the settle window after the last token appears.
+  function waitForIdle({ quietMs = 1000, timeoutMs = 120000 } = {}) {
     return new Promise((resolve) => {
+      const target = document.querySelector(CFG.bubbles)?.closest(
+                       "[class*='chat'], main") || document.body;
       let quiet;
       const obs = new MutationObserver(() => {
         clearTimeout(quiet);
-        quiet = setTimeout(done, quietMs);
+        quiet = setTimeout(() => done(false), quietMs);
       });
-      obs.observe(document.body, { subtree: true, childList: true, characterData: true });
-      quiet = setTimeout(done, quietMs);
+      obs.observe(target, { subtree: true, childList: true, characterData: true });
+      quiet = setTimeout(() => done(false), quietMs);
       const hard = setTimeout(() => done(true), timeoutMs);
-      function done(to) { clearTimeout(quiet); clearTimeout(hard); obs.disconnect(); resolve(to); }
+      function done(timedOut) { clearTimeout(quiet); clearTimeout(hard); obs.disconnect(); resolve(timedOut); }
     });
   }
 
@@ -92,34 +100,65 @@ if (!CFG) {
     return "(no response captured)";
   }
 
-  // ── Minimal HUD with a KILL SWITCH. Runaway loops are the #1 failure mode;
-  //    never build this without one. ──────────────────────────────────────────
+  // ── HUD: glassmorphic pill with live state, turn stats and a KILL SWITCH.
+  //    Runaway loops are the #1 failure mode; never build this without one. ──
+  const hudEl = (() => {
+    const css = chrome?.runtime?.getURL
+      ? chrome.runtime.getURL("hud.css") : null;   // falls back to inline below
+    const box = document.createElement("div");
+    box.id = "__lb_hud";
+    box.className = "lb-connecting";
+    box.innerHTML = `
+      <span class="lb-dot"></span>
+      <span class="lb-agent">${CFG.name}</span>
+      <span class="lb-state">connecting…</span>
+      <span class="lb-stats"></span>
+      <button class="lb-btn lb-danger" title="Halt / resume (Esc)">HALT</button>
+      <button class="lb-btn" title="Collapse">—</button>`;
+    if (css) { const l = document.createElement("link");
+               l.rel = "stylesheet"; l.href = css; box.prepend(l); }
+    else { box.style.cssText = "position:fixed;bottom:18px;right:18px;z-index:2147483647;" +
+           "background:#111a;color:#e8edf4;font:12px monospace;padding:10px 14px;" +
+           "border-radius:14px;border:1px solid #fff2;opacity:.9"; }
+    const style = document.createElement("style");
+    style.textContent = `#__lb_hud{font-family:system-ui,sans-serif}`;
+    box.appendChild(style);
+    document.body.appendChild(box);
+    box.querySelector(".lb-danger").onclick = toggleHalt;
+    box.querySelectorAll(".lb-btn")[1].onclick = () => box.classList.toggle("lb-min");
+    return box;
+  })();
+
+  function toggleHalt() {
+    state.halted = !state.halted;
+    hudEl.querySelector(".lb-danger").classList.toggle("lb-on", state.halted);
+    hud(state.halted ? "HALTED" : "idle");
+  }
+  addEventListener("keydown", (e) => {              // Esc works even mid-flight
+    if (e.key === "Escape") { e.stopPropagation(); toggleHalt(); }
+  }, true);
+
+  const STATE_CLASS = ["connecting","ready","writing","thinking","idle","error","halted"];
   function hud(label) {
-    let box = document.getElementById("__llm_bridge_hud");
-    if (!box) {
-      box = document.createElement("div");
-      box.id = "__llm_bridge_hud";
-      box.style.cssText = `position:fixed;bottom:16px;right:16px;z-index:2147483647;
-        background:#111;color:#0f0;font:12px/1.4 monospace;padding:8px 10px;
-        border:1px solid #0f0;border-radius:6px;opacity:.9`;
-      box.innerHTML = `<span id="__lb_lbl"></span>
-        <button id="__lb_stop" style="margin-left:8px;cursor:pointer">HALT</button>`;
-      document.body.appendChild(box);
-      box.querySelector("#__lb_stop").onclick = () => {
-        state.halted = !state.halted;
-        hud(state.halted ? "HALTED" : "idle");
-      };
-    }
-    box.querySelector("#__lb_lbl").textContent = `[${CFG.name}] ${label}`;
+    // keep any collapse state, swap exactly one lb-<state> class
+    const min = hudEl.classList.contains("lb-min") ? " lb-min" : "";
+    hudEl.className = "__lb_hud" + min;
+    const key = label.toLowerCase();
+    for (const s of STATE_CLASS) if (key.startsWith(s)) hudEl.classList.add("lb-" + s);
+    hudEl.querySelector(".lb-state").textContent = label;
+    hudEl.querySelector(".lb-stats").textContent =
+      state.turns ? `${state.turns}x · ${(state.lastMs/1000).toFixed(1)}s` : "";
   }
 
   // ── Connection ─────────────────────────────────────────────────────────────
+  let backoff = 1000;
   function connect() {
     const ws = new WebSocket(WS_URL);
     state.ws = ws;
     hud("connecting…");
 
     ws.onopen = () => {
+      backoff = 1000;                                 // reset on success
       ws.send(JSON.stringify({ type: "register", agent: CFG.name }));
       hud("ready");
     };
@@ -128,6 +167,7 @@ if (!CFG) {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg.type !== "say" || state.halted) return;
 
+      const t0 = performance.now();
       try {
         hud("writing…");
         await say(msg.text);
@@ -135,15 +175,18 @@ if (!CFG) {
         await waitForStart();
         await waitForIdle();
         const text = lastAssistantText();
+        state.turns++;
+        state.lastMs = performance.now() - t0;
         hud("idle");
         ws.send(JSON.stringify({ type: "reply", agent: CFG.name, text }));
       } catch (e) {
-        hud("ERROR");
+        hud("error");
         ws.send(JSON.stringify({ type: "error", agent: CFG.name, text: String(e) }));
       }
     };
 
-    ws.onclose = () => { hud("reconnecting…"); setTimeout(connect, 2000); };
+    ws.onclose = () => { hud("connecting…"); setTimeout(connect, backoff);
+                         backoff = Math.min(backoff * 2, 15000); };
     ws.onerror = () => ws.close();
   }
 

@@ -67,7 +67,8 @@ The result: genuine multi-model debates, brainstorm ping-pong, or red-team-vs-bl
 |---|---|
 | `manifest.json` | The entire Chrome extension declaration. Deliberately permission-free. |
 | `bridge.js` | The agent node. One instance per tab: injects prompts (React-safe!), detects generation start/end, scrapes replies, shows a HUD with a **HALT kill switch**, auto-reconnects. |
-| `orchestrator.py` | The referee. asyncio + websockets router, alternates turns qwen→deepseek, enforces a hard turn cap, saves `transcript.json`. |
+| `hud.css` | The HUD's look — glassmorphic pill, animated status dot, turn/latency stats. v0.2 design refresh. |
+| `orchestrator.py` | The referee. asyncio + websockets router, alternates turns qwen→deepseek, enforces a hard turn cap, saves `transcript.json`. Now with CLI flags: `--turns`, `--topic`, `--timeout`, `--port`. |
 | `SPEC.md` | The full architecture spec this repo implements — including the hard-won gotchas table. Read it before editing selectors. |
 | `Qwen.md` | Agent instructions for publishing this work to GitHub (done — see PR #1). |
 
@@ -136,19 +137,19 @@ That's a complete, coherent, cross-model debate transcript — generated entirel
 
 ## 👀 End-User Overview: What You'll Actually See
 
-**In each chat tab**, bottom-right, a small black-and-green HUD badge reports that agent's state:
+**In each chat tab**, bottom-right, a glass HUD pill reports that agent's state — with a pulsing status dot (cyan = working, green = idle, amber = ready, red = halted/error), live turn/latency stats, and two buttons:
 
-| Badge | Meaning |
+| State | Meaning |
 |---|---|
-| `[qwen] connecting…` / `reconnecting…` | Trying to reach the orchestrator. Start `orchestrator.py`, then it retries every 2 s. |
-| `[qwen] ready` | Registered and awaiting orders. |
-| `[qwen] writing…` | Injecting the prompt into the site's own text box. |
-| `[qwen] thinking…` | Prompt submitted; waiting for generation to start, then for the DOM to go quiet (1.6 s debounce, 120 s hard cap). |
-| `[qwen] idle` | Reply captured and handed back to the referee. |
-| `[qwen] ERROR` | Something failed (missing selector, blocked socket). Details went to the terminal, prefixed `ERR`. |
-| `[qwen] HALTED` | You pressed the kill switch. This agent ignores all further prompts. |
+| `connecting…` | Trying to reach the orchestrator. Start `orchestrator.py`; retries back off 1 s → 15 s automatically. |
+| `ready` | Registered and awaiting orders. |
+| `writing…` | Injecting the prompt into the site's own text box. |
+| `thinking…` | Prompt submitted; waiting for generation to start, then for the DOM to go quiet (1.0 s debounce, 120 s hard cap). The pill shows `4x · 23.7s` — turns completed and last-turn latency. |
+| `idle` | Reply captured and handed back to the referee. |
+| `error` | Something failed (missing selector, blocked socket). Details went to the terminal, prefixed `ERR`. |
+| `HALTED` | You pressed the kill switch. This agent ignores all further prompts. |
 
-**The HALT button** sits next to the badge, always. Press it in either tab to stop that node instantly; press again to release it. The orchestrator also enforces a hard turn cap server-side, so runaway loops are structurally impossible.
+**Kill switch, twice over:** click **HALT** in the pill — or tap **Esc** anywhere on the page, even mid-generation — to stop that node instantly; repeat to release. The **`—`** button collapses the pill into a slim dot so it never covers the chat. The orchestrator also enforces a hard turn cap server-side, so runaway loops are structurally impossible.
 
 **In the terminal**, you get a live feed:
 
@@ -165,19 +166,18 @@ both agents online. starting.
 ------------------------------------------------------------
 ```
 
-**Afterwards**, `transcript.json` holds every turn as `{turn, agent, text}` — ready to archive, diff, or feed anywhere else.
+**Afterwards**, `transcript.json` holds every turn as `{turn, agent, seconds, text}` — ready to archive, diff, or feed anywhere else. It's streamed after *every* hop, so even a mid-run crash leaves the partial debate on disk.
 
-### 🧪 Want to change the topic? Edit two lines.
+### 🧪 Want to change the topic? Just pass a flag.
 
-At the top of `orchestrator.py`:
+No editing required (v0.2): the orchestrator takes CLI flags —
 
-```python
-TURNS = 6                                   # hard cap; keep ≤ 8 on free tiers
-OPENING = ("Let's debate: is local-first AI more important than cloud AI? "
-           "Take a firm position and argue it in under 120 words. Qwen, you open.")
+```bash
+python orchestrator.py --turns 4 --topic "Let's trade haiku about retirement. One haiku each per turn. Qwen, open."
+python orchestrator.py --help          # --turns · --timeout · --topic · --port
 ```
 
-Rewrite `OPENING` for a poem-passing game, a negotiation sim, or adversarial fact-checking. The plumbing doesn't care what the meat is. 🌯
+The defaults still seed the classic debate (*"Is local-first AI more important than cloud AI?"*) for 6 rounds. Use `--topic` for a poem-passing game, a negotiation sim, or adversarial fact-checking. The plumbing doesn't care what the meat is. 🌯
 
 ### ➕ Want a third model? Add a tab.
 
@@ -205,5 +205,12 @@ The single most common issue: **a site redesigned and broke the CSS selectors.**
 ## 📜 License & Credits
 
 Released under the terms in [`LICENSE`](LICENSE). Architecture, gotcha tables, and selector wisdom documented in [`SPEC.md`](SPEC.md) — treat it as the maintenance manual.
+
+### 🌯 Changelog highlights
+
+**v0.2 — the refinement pass**
+- **Faster:** snappier typing cadence (~150 ms vs ~350 ms), fast initial poll for generation-start detection (60 ms → adaptive), tighter 1.0 s idle debounce, scoped MutationObserver instead of body-wide, instant reconnect backoff reset.
+- **Sleeker:** glassmorphic HUD pill (`hud.css`) with animated status dot, per-state colors, live `turns · latency` stats, and a collapse button so it never covers the chat.
+- **Friendlier:** **Esc = HALT anywhere on the page**, CLI flags (`--turns`, `--topic`, `--timeout`, `--port`) so you change the debate without editing code, crash-proof streaming transcript with per-hop timings.
 
 **Built bold. Kept cheap. Seasoned to taste. 🌯**

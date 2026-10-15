@@ -186,3 +186,17 @@ Report the PR URL back to the user.
   garlic-sauce drip), generated programmatically with Pillow at 16/48/128 px.
 - Verified: `node --check` on all five JS files; manifest JSON valid; PNGs decode at
   correct sizes with transparent corners.
+
+---
+
+## STATUS UPDATE — 2026-10-16 (third pass, read from live GitHub API)
+
+This section supersedes the stale "STATUS: DONE (2026-10-15)" block above.
+
+- Remote `origin` = https://github.com/Esrevorter/Shoarma.git (per this document; PAT stored only in gitignored `/workspace/.env`, never in tracked files).
+- PR #1 (qwen-code-bridge -> main): CLOSED, superseded.
+- PR #2 (shoarma-v0.8-full -> proceed-with-spec.md-40231): CLOSED **and MERGED**; its base branch was subsequently deleted from the remote.
+- PR #3 (shoarma-v0.8-full -> main): OPEN — brings `main` up to released state v0.9.1 (head commit `0692edc`). https://github.com/Esrevorter/Shoarma/pull/3
+- Tagged Releases published & verified via API: v0.8.1, v0.8.3, v0.9.0, v0.9.1 (latest, with chrome zip asset).
+- `main` still points at `3587111` (pre-swarm snapshot); it advances when PR #3 is merged.
+- Safety rules unchanged: no secrets in history, no force-push of `main`, feature branches only, report missing prerequisites truthfully.

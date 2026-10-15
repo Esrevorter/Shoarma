@@ -1,1 +1,3 @@
+.env
+# build artifacts (released via GitHub Releases, not committed)
 dist/

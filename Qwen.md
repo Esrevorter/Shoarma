@@ -279,3 +279,21 @@ Honest caveat: we cannot execute Chrome here; the fix is proven by manifest
 invariants (no background key ⇒ that error class is impossible), syntax
 checks, and the recovery test suite — live load of the v0.9.5 zip is still
 pending on the user's machine.
+
+## v0.9.6 — restore the in-browser engine service worker (arm-failure fix)
+User log 22:06: "engine arm failed: Could not establish connection. Receiving end does not exist."
+Root cause (verified against git history): v0.9.5 (commit 082f278) removed the
+`background.service_worker` entry from manifest.json as a mis-diagnosed fix for the
+"Could not load background script ''" error. That error was actually caused by CI
+shipping a stale zip that omitted swarm-engine.js — fixed properly in v0.9.5b by
+making tools/build_release.py the single builder. With no service worker registered,
+swarm-engine.js never runs, so popup.js's chrome.runtime.sendMessage({type:"arm"})
+hits an empty runtime → "Receiving end does not exist".
+Fixes:
+  • manifest.json: re-registered `"background": { "service_worker": "swarm-engine.js" }`
+    (file verified present in repo + release list; classic-script compatible — no
+    import/export statements; node --check passes). Added "scripting" permission.
+  • swarm-engine.js bumpBadge(): guarded chrome.action with optional-chaining + try/catch
+    so a missing action API can never throw mid-message and kill the worker.
+Verification: recovery test suite green; build validator now enforces non-empty
+service_worker referencing a real file (so this regression cannot ship again).

@@ -508,7 +508,12 @@ async function focusTab(tabId) {
 const liveTabs = new Set();
 function bumpBadge(tabId) {
   if (tabId != null) liveTabs.add(tabId);
-  chrome.action.setBadgeText({ text: liveTabs.size ? String(liveTabs.size) : "" });
+  // v0.9.6 guard: chrome.action is undefined in some contexts (e.g. the node
+  // recovery-test harness). A throw here would kill the worker mid-message —
+  // exactly the class of bug that made arm() "fail" with a phantom error.
+  try {
+    chrome.action?.setBadgeText({ text: liveTabs.size ? String(liveTabs.size) : "" });
+  } catch {}
 }
 chrome.tabs.onRemoved.addListener((tabId) => { liveTabs.delete(tabId); bumpBadge(null); });
 

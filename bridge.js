@@ -54,6 +54,11 @@ const SITES = {
     // box → never submitted). Prefer stable ids/testids, then fall back.
     input:      '#chat-input, textarea[placeholder], textarea[name*="chat" i], textarea',
     send:       'form button[type="submit"], button[aria-label*="Send" i], button[aria-label*="发送"]',
+    // v0.9.10: DeepSeek's composer submits on Ctrl+Enter; bare Enter inserts a
+    // newline (that's why every "full Enter sequence" failed at 00:03:57–
+    // 00:04:08 in the user log while the site ignored it). The bridge now
+    // prefers this declared shortcut before guessing.
+    sendKey:    "ctrl+enter",
     // ⚠️ Scope to ASSISTANT bubbles only, or you'll read your own prompt back.
     bubbles:    '[data-role="assistant"], .markdown-body, [class*="assistant"] [class*="content"]',
     stop:       'button[aria-label*="Stop" i]',
@@ -193,9 +198,22 @@ if (!CFG) {
   // bypassing fields and fire the FULL sequence (beforeinput → input →
   // keydown → keypress → keyup). Sites listening on any of these now see a
   // complete Enter press instead of an isolated keydown.
-  function pressEnter(el) {
+  // v0.9.10: the old pressEnter fired a bare Enter with NO modifier flags —
+  // i.e. exactly Shift+Ctrl+Alt+Meta=false. DeepSeek's composer (and every
+  // React chat that binds Ctrl+Enter to send) treats plain Enter as
+  // newline-insert, so our "full Enter sequence" could NEVER submit there;
+  // it burned all 3 attempts + the retype fallback and then declared
+  // MESSAGE NOT SUBMITTED (user log 2026-10-15 00:03:57→00:04:08). The retry
+  // that "worked" at 00:04:14 only succeeded because the chunked retype had
+  // left React state desynced enough that a stray event flushed the box.
+  // Now: accept explicit modifiers, and probe the site's OWN listener source
+  // (React fiber props / on-key-down handlers) so we fire the exact combo
+  // the app actually listens for instead of guessing.
+  function pressEnter(el, mods = {}) {
     const base = {
       key: "Enter", code: "Enter", keyCode: 13, which: 13, charCode: 13,
+      ctrlKey: !!mods.ctrl, metaKey: !!mods.meta, shiftKey: !!mods.shift,
+      altKey: !!mods.alt,
       bubbles: true, cancelable: true, composed: true,
     };
     try { el.dispatchEvent(new InputEvent("beforeinput", { ...base, inputType: "historyForward" })); } catch {}
@@ -204,11 +222,67 @@ if (!CFG) {
     el.dispatchEvent(new KeyboardEvent("keyup", base));
   }
 
+  // Scan an element's React fiber props AND any addEventListener wrappers for
+  // keyboard handler signatures like "ctrl+enter" / "meta+enter". Cheap: one
+  // pass over own keys per attempt, wrapped in try/catch.
+  function detectEnterCombo(el) {
+    const sigs = [];
+    const scan = (v) => {
+      try {
+        if (typeof v === "string") sigs.push(v.toLowerCase());
+        else if (v && typeof v === "object") {
+          for (const k of Object.keys(v)) {
+            const kv = String(k).toLowerCase();
+            if (/(ctrl|cmd|meta|alt|shift|mod)\s*\+\s*enter/.test(kv)) sigs.push(kv);
+            if (kv === "sendshortcut" || kv === "submitkey") sigs.push(String(v[k]).toLowerCase());
+          }
+        } else if (typeof v === "function") {
+          const src = String(v);
+          for (const m of src.matchAll(/(?:ctrl|cmd|meta|alt|shift|mod)\s*(?:\+|\u002b\s*['"`]?)\s*enter/gi)) sigs.push(m[0].toLowerCase());
+          if (/metaKey|ctrlKey/.test(src) && /["']Enter["']/.test(src)) sigs.push("mod+enter");
+        }
+      } catch {}
+    };
+    try {
+      for (const k of Object.keys(el)) {
+        if (!k.startsWith("__reactFiber$") && !k.startsWith("__reactProps$")) continue;
+        let node = el[k], hops = 0;
+        while (node && hops++ < 12) {
+          for (const p of [node.memoizedProps, node.pendingProps]) {
+            if (!p || typeof p !== "object") continue;
+            for (const key of Object.keys(p)) {
+              if (/^on(KeyDown|KeyDownCapture|Submit)$|shortcut/i.test(key)) scan(p[key]);
+            }
+            if (p.sendShortcut != null) scan({ sendShortcut: p.sendShortcut });
+          }
+          node = node.return;
+        }
+      }
+    } catch {}
+    // wrapper objects installed by some editors' event systems
+    try {
+      for (const k of ["__reactEvents$", "__handlers$", "__events$"]) {
+        for (const key of Object.keys(el)) {
+          if (key.startsWith(k)) for (const v of Object.values(el[key] || {})) scan(v);
+        }
+      }
+    } catch {}
+    const joined = sigs.join(" ");
+    if (/\b(ctrl|cmd|meta|mod)\s*\+/.test(joined) && /enter/.test(joined)) return { ctrl: true };
+    if (/\balt\s*\+\s*enter/.test(joined)) return { alt: true };
+    return null;                                      // no evidence → caller decides
+  }
+
   // v0.7: find the send button ANYWHERE — light DOM, shadow roots, or nested
   // iframes (deepseek/qwen both hide it in places querySelector misses).
   // v0.7.1: ALSO match by icon/svg proximity to the input and by generic
   // arrow-up/arrow-right glyphs used by qwen/deepseek send buttons.
-  function findSendButton(doc) {
+  // v0.9.10: `doc` may be a real Document OR a querySelectorAll-only shim
+  // (used by say()'s disabled-button retry channel). isVisible() additionally
+  // gained allowDisabled — the site's arrow button exists and is VISIBLE on
+  // DeepSeek, just .disabled while React state lags; refusing to click it was
+  // why "clicking send button" never even appeared in the user's log.
+  function findSendButton(doc, opts = {}) {
     doc = doc || document;
     const sels = [
       CFG.send,
@@ -220,30 +294,31 @@ if (!CFG) {
       for (const sel of sels) {
         if (!sel) continue;
         for (const b of doc.querySelectorAll(sel)) {
-          if (isVisible(b)) return b;
+          if (isVisible(b, opts)) return b;
         }
       }
       // heuristic: a button near the chat input containing an arrow/send icon
-      const inp = doc.querySelector(CFG.input);
+      const inp = doc.querySelector ? doc.querySelector(CFG.input) : null;
       if (inp) {
         const wrap = inp.closest("form") || inp.parentElement?.parentElement?.parentElement || doc.body;
         for (const b of wrap.querySelectorAll("button")) {
-          if (!isVisible(b)) continue;
+          if (!isVisible(b, opts)) continue;
           const html = (b.innerHTML || "").toLowerCase();
           if (/svg|icon/i.test(html) && /arrow|send|submit|up|right|plane|paper.?clip/i.test(b.getAttribute("aria-label") + " " + b.getAttribute("title") + " " + b.className)) return b;
           if (html.includes("<svg")) return b;   // last resort: any svg-icon button next to the input
         }
       }
       for (const host of doc.querySelectorAll("*")) {
-        if (host.shadowRoot) { const b = findSendButton(host.shadowRoot); if (b) return b; }
+        if (host.shadowRoot) { const b = findSendButton(host.shadowRoot, opts); if (b) return b; }
       }
     } catch {}
     return null;
   }
 
-  function isVisible(el) {
+  function isVisible(el, opts = {}) {
     try {
-      if (!el || el.disabled) return false;
+      if (!el) return false;
+      if (el.disabled && !opts.allowDisabled) return false;
       const r = el.getBoundingClientRect();
       return r.width > 4 && r.height > 4 && getComputedStyle(el).visibility !== "hidden";
     } catch { return false; }
@@ -462,10 +537,48 @@ if (!CFG) {
         form.requestSubmit();
         if (await waitBoxEmptied(el, 1500)) { submitted = true; break; }
       }
+      // v0.9.10: send channels #3/#4 — modifier-aware Enter combos. The old
+      // code only ever pressed BARE Enter (all modifier flags false). Sites
+      // that bind Ctrl+Enter/Meta+Enter to "send" treat bare Enter as a
+      // newline, so every attempt was doomed and the bridge fell through to
+      // the expensive retype + failure path (DeepSeek log 00:03:57→00:04:08).
       if (!submitted) {
-        lbLog("DEBUG", `send channel #3: full Enter sequence (attempt ${attempt})`);
-        pressEnter(el);
-        if (await waitBoxEmptied(el, 2000)) { submitted = true; break; }
+        const combo = detectEnterCombo(el);
+        // v0.9.10: prefer the site's OWN declared shortcut (detected or
+        // configured in SITES[name].sendKey), then try Ctrl → plain → Meta.
+        const preferred = combo || (CFG.sendKey === "ctrl+enter" ? { ctrl: true }
+                                : CFG.sendKey === "meta+enter" ? { meta: true }
+                                : null);
+        const variants = [];
+        if (preferred) variants.push(preferred);
+        for (const v of [{ ctrl: true }, {}, { meta: true }]) {
+          if (!variants.some(w => !!w.ctrl === !!v.ctrl && !!w.meta === !!v.meta)) variants.push(v);
+        }
+        for (const v of variants) {
+          if (submitted) break;
+          const label = v.ctrl ? "Ctrl+Enter" : v.meta ? "Meta+Enter" : "plain Enter";
+          lbLog("DEBUG", `send channel #3: ${label} sequence (attempt ${attempt})`, { detected: !!combo });
+          pressEnter(el, v);
+          if (await waitBoxEmptied(el, 2000)) { submitted = true; break; }
+        }
+      }
+      // v0.9.10: channel #4 — trust the site's OWN UI. DeepSeek keeps its
+      // arrow button rendered but DISABLED while React state lags our value
+      // injection; the old isVisible() check rejected disabled buttons, so we
+      // never even tried it. A click on a disabled button is harmless, and if
+      // React has actually caught up (reactValueOf non-empty) this is the most
+      // faithful "press the real Send" channel we have.
+      if (!submitted) {
+        const rvNow = reactValueOf(el);
+        if (rvNow !== null && rvNow.trim()) {
+          const btn2 = findSendButton(document, { allowDisabled: true });
+          if (btn2) {
+            lbLog("DEBUG", "send channel #4: clicking site send button despite disabled state (React value is live)",
+                  { label: (btn2.getAttribute("aria-label") || btn2.textContent || "").trim().slice(0, 30), reactChars: rvNow.length });
+            dispatchClick(btn2);
+            if (await waitBoxEmptied(el, 2500)) submitted = true;
+          }
+        }
       }
       if (!submitted && attempt < 3) lbLog("WARN", `message still sitting in box after attempt ${attempt} — re-injecting`);
     }
@@ -498,10 +611,21 @@ if (!CFG) {
           await sleep(isCE(el) ? 30 : 15);
         }
         await sleep(250);
-        pressEnter(el);
-        if (!(await waitBoxEmptied(el, 1500))) {
-          const b2 = findSendButton();
-          if (b2) { dispatchClick(b2); await waitBoxEmptied(el, 1500); }
+        // v0.9.10: same modifier-aware send as channel #3/#4 — the retype
+        // fallback used to press bare Enter only, which a Ctrl+Enter site
+        // treats as a newline (leaving the whole text in the box).
+        {
+          const comboR = detectEnterCombo(el) || (CFG.sendKey === "ctrl+enter" ? { ctrl: true }
+                        : CFG.sendKey === "meta+enter" ? { meta: true } : null);
+          let emptied = false;
+          for (const v of [comboR, { ctrl: true }, {}, { meta: true }].filter(Boolean)) {
+            pressEnter(el, v);
+            if (await waitBoxEmptied(el, 1500)) { emptied = true; break; }
+          }
+          if (!emptied) {
+            const b2 = findSendButton(document, { allowDisabled: true });
+            if (b2) { dispatchClick(b2); await waitBoxEmptied(el, 1500); }
+          }
         }
         submitted = !readBox(el).trim();
       } catch (e) { lbLog("ERROR", "retype fallback threw", { err: String(e).slice(0, 120) }); }

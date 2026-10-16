@@ -228,6 +228,12 @@ function lastAttemptSucceeded() { return _attemptPromise; }
 
 async function handleFailedTurn(fromName) {
   if (retrying || ENGINE.state !== "running") return;
+  // v0.9.10 BUGFIX (test-v094-recovery + real log 00:04:13): capture the agent
+  // that FAILED here. ENGINE.current changes synchronously when a late reply
+  // is adopted/handed off mid-cool-down; comparing against the LIVE value let
+  // the retry loop re-inject the already-answered prompt into deepseek while
+  // qwen was typing it — duplicate prompts, multi-minute CPU-burning races.
+  const failedAgent = fromName || ENGINE.current;
   retrying = true;
   try {
     for (const wait of [5, 10]) {
@@ -235,7 +241,7 @@ async function handleFailedTurn(fromName) {
       // cool-down too — in the user log the reply landed while the chain was
       // still entering coolDown(); waiting another 5 s only risked the site
       // seeing our clear_input flush mid-generation.
-      const earlyAdopt = await adoptLateReply();
+      const earlyAdopt = await adoptLateReply(failedAgent);
       if (earlyAdopt) { _attemptPromise = null; return; }
       // v0.9.4: skip the cool-down flush when a turn is ALREADY in flight
       // again — the late reply was adopted via onReply while we raced the
@@ -251,6 +257,21 @@ async function handleFailedTurn(fromName) {
       }
       await coolDown(wait);
       if (ENGINE.state !== "running") return;
+      // v0.9.10 BUGFIX ("late reply adopted, then the same prompt injected a
+      // SECOND time"): coolDown() awaits 5–10 s. A reply landing DURING that
+      // window is recorded by onReply and handed off to the partner agent —
+      // which arms ENGINE.timers.reply. The stale checks below only looked at
+      // transcript entries tagged with the FAILED agent, so they missed it,
+      // and this loop re-injected the same prompt into the live composer
+      // (user log 2026-10-16 00:04:13: engine re-dispatched while the bridge
+      // was mid-generation → duplicate prompts + a CPU-burning race). Now:
+      // any attempt promise that already resolved true means the turn is
+      // settled — stop retrying immediately.
+      if (_attemptPromise === DONE_OK) { _attemptPromise = null; return; }
+      if (ENGINE.timers.reply) {                       // a fresh dispatch owns the run now
+        engLog("INFO", "reply landed during cool-down — turn already handed off, skipping re-dispatch");
+        return;
+      }
       // v0.9.4: THE TURN MAY HAVE ACTUALLY SUCCEEDED. The user log of
       // 2026-10-15 19:33→19:36 shows exactly this: DeepSeek's reply landed at
       // 19:33:32 ("turn #1 complete :: deepseek") while the qwen bridge was
@@ -261,10 +282,15 @@ async function handleFailedTurn(fromName) {
       // Now: before each re-dispatch, check whether the target agent already
       // answered the in-flight prompt; if so, adopt that reply and continue
       // the swarm instead of hammering a live composer.
-      const adopted = await adoptLateReply();
+      const adopted = await adoptLateReply(failedAgent);
       if (adopted) { _attemptPromise = null; return; }
       // v0.9.2: force-release the target agent first — the bridge is done
       // (it just reported failure), so any lingering busy/queue is stale.
+      if (ENGINE.current !== failedAgent) {
+        engLog("INFO", "turn handed off during cool-down — skipping re-dispatch",
+               { current: ENGINE.current, failedAgent });
+        return;
+      }
       releaseAgent(ENGINE.current);
       engLog("INFO", `re-dispatching current prompt to ${ENGINE.current}`, { after: wait + "s" });
       const okP = new Promise((res) => { _attemptResolve = res; });
@@ -293,14 +319,22 @@ async function handleFailedTurn(fromName) {
 // deciding whether to retry? onReply pushes transcript entries synchronously,
 // so a fresh entry tagged with the current speaker means the late reply won
 // the race — adopt it and let the conversation continue.
-async function adoptLateReply() {
-  const cur = ENGINE.current;
+async function adoptLateReply(failedAgent) {
+  // v0.9.10 BUGFIX: look for the late reply from the agent whose SEND failed.
+  // If a reply was already adopted and handed off, ENGINE.current is the
+  // PARTNER now — checking against it matched nothing (or worse, re-adopted),
+  // which let handleFailedTurn fall through to a duplicate re-dispatch.
+  const cur = failedAgent || ENGINE.current;
   if (!cur) return false;
   const last = ENGINE.transcript[ENGINE.transcript.length - 1];
   if (!last || last.agent !== cur || !last.captured) return false;
+  if (ENGINE.current !== cur) return false;   // already adopted/handed off elsewhere
   engLog("WARN", `late reply from ${cur} already captured — adopting it instead of re-sending`,
          { chars: String(last.text || "").length, preview: String(last.text || "").slice(0, 60) });
-  clearTimeout(ENGINE.timers.reply);
+  // v0.9.10: clear the stale watchdog WITHOUT nulling timers.reply — a live
+  // reply timer armed during coolDown() belongs to a fresh dispatch and must
+  // keep protecting the run.
+  if (ENGINE.timers.reply) { clearTimeout(ENGINE.timers.reply); }
   settleAttempt(true);
   releaseAgent(cur);
   const next = ENGINE.partnerOf[cur] || [...ENGINE.agents.keys()].find(n => n !== cur);
@@ -311,7 +345,14 @@ async function adoptLateReply() {
 }
 
 let _attemptResolve = null;
-function settleAttempt(v) { try { _attemptResolve?.(v); } catch {} _attemptResolve = null; }
+// v0.9.10: settleAttempt(true) replaces the pending promise with this
+// SENTINEL instead of leaving it dangling, so handleFailedTurn (which may be
+// parked inside coolDown()'s 5–10 s await) can synchronously check
+// `_attemptPromise === DONE_OK` and learn the turn was settled DURING the
+// wait — previously that information only lived inside an already-resolved
+// promise nobody re-checked, and the retry loop re-dispatched a dead prompt.
+const DONE_OK = Symbol("attempt-ok");
+function settleAttempt(v) { try { _attemptResolve?.(v); } catch {} _attemptResolve = null; if (v === true) _attemptPromise = DONE_OK; }
 
 // ── what bridges send us ───────────────────────────────────────────────────
 
@@ -347,21 +388,35 @@ function onReply(msg, fromName) {
     engLog("DEBUG", `duplicate reply frame from ${fromName} ignored`, { chars: text.length });
     return;
   }
-  // v0.9.4 (test-verified): a captured:true error frame means the bridge's
-  // say() THREW but it still managed to capture the real reply late. RECORD
-  // the entry (adoptLateReply reads it synchronously — onReply pushes before
-  // returning), but do NOT touch timers or hand off: onSendFailure's
-  // cool-down chain owns pacing and its adoptLateReply() performs the single
-  // correct handoff. Doing both here raced two adoptions (double turn counts,
-  // duplicate says — exactly what test-v094-recovery caught).
+  // v0.9.10 BUGFIX (test-v094-recovery + real log 00:04:08→00:04:13): the old
+  // design recorded the captured:true error frame and waited for a cool-down
+  // chain to "adopt" it later. But when the send_failed frame arrived FIRST,
+  // handleFailedTurn bailed out early ("turn already re-dispatched") whenever
+  // any live reply timer existed — so the adoption NEVER ran, the reply was
+  // never handed to the partner, and the run stalled at turn #1 while the
+  // watchdog spun. Now the reply is adopted IMMEDIATELY in the single owner
+  // path below; no separate adoptLateReply pass is needed for this frame.
   if (!isReplyFrame && captured) {
     ENGINE.transcript.push({ role: "assistant", agent: fromName, text, ts: Date.now(), captured });
     // v0.9.4 (test-verified): count the adopted turn HERE so the HUD's turn
     // pill and the engine-state frame are truthful immediately. adoptLateReply
     // performs the handoff but must not double-count.
     ENGINE.turnCount += 1;
-    engLog("WARN", `late-captured reply from ${fromName} recorded as turn #${ENGINE.turnCount} (${text.length} chars) — awaiting cool-down adoption`,
+    engLog("WARN", `late-captured reply from ${fromName} recorded as turn #${ENGINE.turnCount} (${text.length} chars) — adopting immediately`,
            { preview: text.slice(0, 60) });
+    // v0.9.10: ADOPT NOW instead of deferring to a cool-down chain that may
+    // have already bailed out. releaseAgent + settleAttempt happened above;
+    // stop any retry loop that is parked mid-cool-down (its fresh guards also
+    // check DONE_OK / current-agent), then hand the reply to the partner with
+    // a fresh watchdog. This is the ONE handoff for this frame.
+    retrying = false;
+    _attemptPromise = DONE_OK;
+    _attemptResolve = null;
+    if (ENGINE.current !== fromName) { broadcastState(); return; }  // handed off already
+    const nextAdopt = ENGINE.partnerOf[fromName] || [...ENGINE.agents.keys()].find(n => n !== fromName);
+    if (!nextAdopt) { finishRun("no-partner"); return; }
+    ENGINE.current = nextAdopt;
+    sendPromptToCurrent(text || "(empty reply — please continue the thread)");
     broadcastState();
     return;
   }
@@ -391,8 +446,15 @@ function onSendFailure(msg, fromName) {
   // prompt's timer already fired or was settled, clear it so handleFailedTurn
   // can own the pacing from here (it re-arms deliberately via
   // armReplyTimeout on every re-dispatch).
-  clearTimeout(ENGINE.timers.reply);
-  ENGINE.timers.reply = null;
+  // v0.9.10 BUGFIX (test-v094-recovery failure): this used to NULL the reply
+  // timer, so handleFailedTurn's "a fresh dispatch owns the run now" check
+  // could never see a live watchdog armed by an immediate handoff (onReply
+  // path) and the retry loop re-injected a prompt that was already answered
+  // (the real-log duplicate-prompt spiral at 00:04:13). Now: clear only a
+  // DEAD timer (already fired), keep a live one as the ownership marker.
+  if (ENGINE.timers.reply) {
+    clearTimeout(ENGINE.timers.reply);   // cancel the stale watchdog; keep the handle
+  }
   engLog("ERROR", `bridge reports MESSAGE NOT SUBMITTED (${fromName})`,
          { preview: String(msg.preview || "").slice(0, 60) });
   handleFailedTurn(fromName);
@@ -516,7 +578,7 @@ async function handleEngineMessage(msg, sender, respond) {
     //    mirror halted toggles to every agent so a HALT in one tab stops all.
     case "activate-tab": {
       const tid = sender.tab?.id;
-      if (tid == null) { respond({ ok: false, error: "no tab" }); return false; }
+      if (tid === undefined || tid === null) { respond({ ok: false, error: "no tab" }); return false; }
       // v0.9.8: focusTab is async ⇒ real Promise; guarded anyway so a weird
       // host environment can't hand us undefined and crash the worker.
       safeCatch(focusTab(tid).then(() => respond({ ok: true })),

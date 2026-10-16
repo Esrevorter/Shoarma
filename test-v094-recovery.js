@@ -53,6 +53,10 @@ global.chrome = {
 };
 
 const src = fs.readFileSync(__dirname + "/swarm-engine.js", "utf8");
+// v0.9.10: the engine registers a last-resort unhandledrejection shield on
+// `self` (present in service workers, absent in plain node) — shim it here so
+// the REAL file loads unchanged.
+if (typeof self === "undefined") globalThis.self = { addEventListener() {} };
 // Load the REAL engine file in this exact scope via direct eval so its
 // top-level bindings (ENGINE, deliver, …) are visible to everything below.
 eval(src);

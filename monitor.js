@@ -132,8 +132,15 @@ async function drainEngineRing() {
     const key = `${e.ts}|${e.agent}|${e.msg}`;
     if (seenEngineSeq.has(key)) continue;
     seenEngineSeq.add(key);
+    // v0.9.10 BUGFIX ("monitor totally not working — nothing shows up"):
+    // renderEvent unconditionally did lastSeq = Math.max(lastSeq, ev.seq) and
+    // engine lines carry NO seq → undefined → Math.max(...) = NaN → lastSeq
+    // became NaN on the FIRST drained line. Thereafter every remote-mode
+    // event failed `ev.seq > lastSeq` (NaN comparisons are always false), so
+    // the feed AND the copy buffer stayed empty forever — exactly the dead
+    // monitor reported after a run where the ring had filled fine.
     renderEvent({ type: "log", agent: e.agent || "engine", level: e.level, msg: e.msg,
-                  data: e.data, ts: new Date(e.ts || Date.now()).toLocaleTimeString() });
+                  data: e.data, ts: new Date(e.ts || Date.now()).toLocaleTimeString(), seq: 0 });
   }
 }
 async function pollEngine() {
@@ -153,7 +160,7 @@ async function pollEngine() {
         const key = `${l.ts}|${l.agent || "engine"}|${l.msg}`;
         if (seenEngineSeq.has(key)) continue;
         seenEngineSeq.add(key);
-        renderEvent({ type: "log", agent: "engine", level: l.level, msg: l.msg, data: l.data, ts: l.ts });
+        renderEvent({ type: "log", agent: "engine", level: l.level, msg: l.msg, data: l.data, ts: l.ts, seq: 0 });
       }
     } catch {}
   }
@@ -161,7 +168,7 @@ async function pollEngine() {
   // hundreds of duplicates flooded the feed and the copy buffer)
   if (swarmState.state && swarmState.ts > lastSwarmTs) {
     lastSwarmTs = swarmState.ts;
-    renderEvent({ type: "log", agent: "engine", level: "INFO",
+    renderEvent({ type: "log", agent: "engine", level: "INFO", seq: 0,
                   msg: `state → ${swarmState.state} · turn ${swarmState.turn ?? 0}/${swarmState.turns ?? "?"} · agents: ${(swarmState.agents || []).join(", ") || "none"}` });
   }
   if (Object.keys(agents).length) renderAgents(agents);
@@ -223,7 +230,10 @@ function renderAgents(agents) {
 }
 
 function renderEvent(ev) {
-  lastSeq = Math.max(lastSeq, ev.seq);
+  // v0.9.10: never poison lastSeq with NaN — engine lines arrive without a
+  // seq (remote-mode events carry one). A single undefined would turn lastSeq
+  // into NaN and permanently break the `ev.seq > lastSeq` gate in remote mode.
+  if (Number.isFinite(ev.seq)) lastSeq = Math.max(lastSeq, ev.seq);
   const feed = $("feed");
   $("empty")?.remove();
   const d = document.createElement("div");

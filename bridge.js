@@ -282,6 +282,13 @@ if (!CFG) {
   // gained allowDisabled — the site's arrow button exists and is VISIBLE on
   // DeepSeek, just .disabled while React state lags; refusing to click it was
   // why "clicking send button" never even appeared in the user's log.
+  // v0.9.11: two more classes of miss fixed —
+  //   • isVisible() rejected any element carrying a truthy `disabled` even on
+  //     non-form-control nodes (CE div "buttons"), so on DeepSeek's current
+  //     build the send affordance was invisible to every channel and the log
+  //     never showed a "clicking send button" line at all.
+  //   • the selector list only knew about <button>s. Div/span-based send
+  //     affordances ([role=button] with send hints) are now matched too.
   function findSendButton(doc, opts = {}) {
     doc = doc || document;
     const sels = [
@@ -289,6 +296,8 @@ if (!CFG) {
       'button[type="submit"]',
       '[aria-label*="send" i]', '[title*="send" i]', '[data-testid*="send" i]',
       '[aria-label*="submit" i]', '[class*="send-button" i]', '[class*="sendBtn" i]',
+      '[role="button"][class*="send" i]', '[role="button"][aria-label*="send" i]',
+      '[class*="submit" i][role="button"]',
     ];
     try {
       for (const sel of sels) {
@@ -318,10 +327,84 @@ if (!CFG) {
   function isVisible(el, opts = {}) {
     try {
       if (!el) return false;
-      if (el.disabled && !opts.allowDisabled) return false;
+      // v0.9.11: `disabled` is a live IDL property only on form controls. A
+      // contenteditable DIV with the attribute disabled="true" returned false
+      // here forever — so on DeepSeek's current build (send affordance is a
+      // CE host / div role="button", not a <button>) channel #1 and #4 could
+      // NEVER find the arrow and the log showed no "clicking send button"
+      // line at all. Only reject REAL control disables unless allowDisabled.
+      if (el.disabled === true && !opts.allowDisabled) return false;
       const r = el.getBoundingClientRect();
       return r.width > 4 && r.height > 4 && getComputedStyle(el).visibility !== "hidden";
     } catch { return false; }
+  }
+
+  // v0.9.11: does this element LOOK enabled? Covers both real form controls
+  // (the .disabled property) and div-buttons that carry only the disabled
+  // ATTRIBUTE (custom components set aria-disabled/disabled without ever
+  // wiring up the property).
+  function looksEnabled(el) {
+    try {
+      if (!el) return false;
+      if (el.disabled === true) return false;
+      if (el.getAttribute?.("aria-disabled") === "true") return false;
+      if (el.hasAttribute?.("disabled")) return false;
+      return true;
+    } catch { return false; }
+  }
+
+  // v0.9.11: React attaches its delegated key listeners to the ROOT container
+  // of the composer subtree, NOT to the <textarea> itself. detectEnterCombo()
+  // walking only the input's own fiber chain therefore found nothing on
+  // DeepSeek (log 2026-10-16 00:31: every Enter fired at the textarea was
+  // ignored by the app-level handler, which lives several ancestors up). Now
+  // we walk the fiber chains of the input AND its ancestors before falling
+  // back to the configured shortcut.
+  function detectEnterComboDeep(el) {
+    for (let n = el, d = 0; n && d < 8; n = n.parentElement, d++) {
+      const combo = detectEnterCombo(n);
+      if (combo) return combo;
+    }
+    // v0.9.11b: React stores event listeners in the *legacy* prop
+    // `unstable_onKeyDown` on DOM fibers — detectEnterCombo()'s regex only
+    // matches /^on(…)$/ keys, so DeepSeek's composer shortcut was invisible
+    // to us even after walking ancestors. Scan unstable_on* keys directly.
+    try {
+      for (const k of Object.keys(el)) {
+        if (!k.startsWith("__reactFiber$")) continue;
+        let node = el[k], hops = 0;
+        while (node && hops++ < 25) {
+          for (const p of [node.memoizedProps, node.pendingProps]) {
+            if (!p || typeof p !== "object") continue;
+            for (const key of Object.keys(p)) {
+              if (/^unstable_on(KeyDown|KeyPress|Submit)$|shortcut/i.test(key)) {
+                const combo = (() => {
+                  const sigs = [];
+                  const scanV = (v) => {
+                    try {
+                      if (typeof v === "string") sigs.push(v.toLowerCase());
+                      else if (typeof v === "function") {
+                        const src = String(v);
+                        if (/ctrlKey/.test(src) && /["']Enter["']/.test(src)) sigs.push("ctrl+enter");
+                        if (/metaKey/.test(src) && /["']Enter["']/.test(src)) sigs.push("meta+enter");
+                      }
+                    } catch {}
+                  };
+                  scanV(p[key]);
+                  const hit = sigs.find(s => /ctrl.*enter/.test(s)) ? { ctrl: true }
+                            : sigs.find(s => /(meta|cmd).*enter/.test(s)) ? { meta: true } : null;
+                  return hit;
+                })();
+                if (combo) return combo;
+              }
+            }
+          }
+          node = node.return;
+        }
+        break;                                          // one fiber root is enough
+      }
+    } catch {}
+    return null;
   }
 
   // v0.7.1: find the chat input ANYWHERE — textarea, contenteditable divs,
@@ -377,6 +460,54 @@ if (!CFG) {
       }
     } catch {}
     return null;                                       // no fiber found — unknown
+  }
+
+  // ── v0.9.11: direct React handler invocation ──────────────────────────────
+  // Synthetic MouseEvents dispatched from a content script bubble through the
+  // DOM, but React 17+ delegates listeners at the app root and some handlers
+  // additionally guard on event.isTrusted or on internal synthetic-event
+  // plumbing our events lack. The most faithful last-mile channel is to read
+  // the element's own fiber props and CALL the handler (onClick / onSubmit /
+  // onKeyDown…) with a minimal fake event object. Returns true if a handler
+  // was found and invoked without throwing — callers then re-check the box.
+  function invokeReactHandler(el, propName) {
+    try {
+      for (const k of Object.keys(el)) {
+        if (!k.startsWith("__reactFiber$") && !k.startsWith("__reactProps$")) continue;
+        let node = el[k], hops = 0;
+        while (node && hops++ < 20) {
+          for (const p of [node.memoizedProps, node.pendingProps]) {
+            const fn = p && p[propName];
+            if (typeof fn === "function") {
+              const evt = makeFakeSyntheticEvent(el, propName);
+              fn(evt);
+              lbLog("DEBUG", `invoked React ${propName} directly`, { tag: el.tagName });
+              return true;
+            }
+          }
+          node = node.return;
+        }
+      }
+    } catch (e) { lbLog("DEBUG", `React ${propName} invocation failed`, { err: String(e).slice(0, 100) }); }
+    return false;
+  }
+
+  function makeFakeSyntheticEvent(el, propName) {
+    // Small duck-typed event: real handlers touch target/currentTarget,
+    // preventDefault/stopPropagation, and sometimes nativeEvent/key flags.
+    const base = {
+      type: propName.replace(/^on/, "").toLowerCase(),
+      target: el, currentTarget: el, srcElement: el,
+      bubbles: true, cancelable: true, defaultPrevented: false,
+      isTrusted: true,                       // some guards check exactly this
+      nativeEvent: new Event("synthetic"),
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() {}, stopImmediatePropagation() {},
+      persist() {},
+    };
+    if (/key/i.test(propName)) Object.assign(base, { key: "Enter", code: "Enter", keyCode: 13, which: 13 });
+    if (/click/i.test(propName)) Object.assign(base, { button: 0, clientX: 0, clientY: 0 });
+    return base;
   }
 
   function readBox(el) {
@@ -543,7 +674,13 @@ if (!CFG) {
       // newline, so every attempt was doomed and the bridge fell through to
       // the expensive retype + failure path (DeepSeek log 00:03:57→00:04:08).
       if (!submitted) {
-        const combo = detectEnterCombo(el);
+        // v0.9.11: channel #3b — fire the Enter combo at the composer's own
+        // wrapper/form too, not just the textarea. React's delegated keydown
+        // listener can live on an ancestor; an event whose target is the
+        // textarea still bubbles there, but some handlers bail unless the
+        // event originated inside the container they manage (DeepSeek log
+        // 2026-10-16 00:31: Ctrl/plain/Meta all landed, nothing submitted).
+        const combo = detectEnterComboDeep(el);
         // v0.9.10: prefer the site's OWN declared shortcut (detected or
         // configured in SITES[name].sendKey), then try Ctrl → plain → Meta.
         const preferred = combo || (CFG.sendKey === "ctrl+enter" ? { ctrl: true }
@@ -554,12 +691,61 @@ if (!CFG) {
         for (const v of [{ ctrl: true }, {}, { meta: true }]) {
           if (!variants.some(w => !!w.ctrl === !!v.ctrl && !!w.meta === !!v.meta)) variants.push(v);
         }
+        const targets = [el];
+        const wrap = el.closest("form") || el.parentElement;
+        if (wrap && wrap !== el) targets.push(wrap);
+        // v0.9.11b: when the Enter combo is DETECTED from a fiber prop, that
+        // exact function IS the app's submit handler. React's root-delegated
+        // listeners don't fire for untrusted synthetic KeyboardEvents in many
+        // current builds (DeepSeek log 2026-10-16 00:31: Ctrl/plain/Meta all
+        // landed with zero effect), so additionally INVOKE the detected
+        // handler directly with a fake event carrying the right modifiers.
+        // Harmless double-submit risk is bounded: we re-check the box after.
+        const invokedDetected = [];
+        if (combo) {
+          for (let n = el, d = 0; n && d < 8; n = n.parentElement, d++) {
+            try {
+              for (const k of Object.keys(n)) {
+                if (!k.startsWith("__reactFiber$")) continue;
+                let node = n[k], hops = 0;
+                while (node && hops++ < 25) {
+                  for (const p of [node.memoizedProps, node.pendingProps]) {
+                    if (!p || typeof p !== "object") continue;
+                    for (const key of Object.keys(p)) {
+                      if (/^unstable_onKeyDown$|^onKeyDown$|shortcut/i.test(key) && typeof p[key] === "function") {
+                        const src = String(p[key]);
+                        if ((/ctrlKey/.test(src) || /metaKey/.test(src)) && /["']Enter["']/.test(src)) {
+                          if (!invokedDetected.includes(p[key])) invokedDetected.push(p[key]);
+                        }
+                      }
+                    }
+                  }
+                  node = node.return;
+                }
+              }
+            } catch {}
+          }
+        }
         for (const v of variants) {
           if (submitted) break;
           const label = v.ctrl ? "Ctrl+Enter" : v.meta ? "Meta+Enter" : "plain Enter";
           lbLog("DEBUG", `send channel #3: ${label} sequence (attempt ${attempt})`, { detected: !!combo });
           pressEnter(el, v);
           if (await waitBoxEmptied(el, 2000)) { submitted = true; break; }
+          for (const t of targets.slice(1)) {
+            if (submitted) break;
+            pressEnter(t, v);
+            if (await waitBoxEmptied(el, 1200)) submitted = true;
+          }
+          if (!submitted && combo && ((!!v.ctrl === !!combo.ctrl) && (!!v.meta === !!combo.meta))) {
+            for (const fn of invokedDetected) {
+              try {
+                fn(makeFakeSyntheticEvent(el, "onKeyDown"));
+                lbLog("DEBUG", "channel #3b: invoked detected onKeyDown handler directly");
+                if (await waitBoxEmptied(el, 2000)) { submitted = true; break; }
+              } catch {}
+            }
+          }
         }
       }
       // v0.9.10: channel #4 — trust the site's OWN UI. DeepSeek keeps its
@@ -568,15 +754,33 @@ if (!CFG) {
       // never even tried it. A click on a disabled button is harmless, and if
       // React has actually caught up (reactValueOf non-empty) this is the most
       // faithful "press the real Send" channel we have.
+      // v0.9.11: two upgrades —
+      //   • the guard no longer requires reactValueOf to be non-EMPTY. On
+      //     DeepSeek's current build the composer's controlled value lives on
+      //     a fiber ABOVE/BESIDE the textarea, so reactValueOf reads "" even
+      //     though the app clearly holds our text (the box shows it). That
+      //     gate silently killed channel #4 in the 00:31 log. We now only skip
+      //     when React state is PROVEN empty AND the DOM is also empty-ish;
+      //     otherwise we try the click (a dead click costs ~2.5 s, far less
+      //     than the retype spiral it prevents).
+      //   • after dispatchClick we ALSO invoke React's own onClick prop on
+      //     the button's fiber chain — synthetic MouseEvents don't always
+      //     reach handlers attached via root delegation with isTrusted checks.
       if (!submitted) {
         const rvNow = reactValueOf(el);
-        if (rvNow !== null && rvNow.trim()) {
+        const domFull = !!readBox(el).trim();
+        if ((rvNow !== null && rvNow.trim()) || domFull) {
           const btn2 = findSendButton(document, { allowDisabled: true });
           if (btn2) {
-            lbLog("DEBUG", "send channel #4: clicking site send button despite disabled state (React value is live)",
-                  { label: (btn2.getAttribute("aria-label") || btn2.textContent || "").trim().slice(0, 30), reactChars: rvNow.length });
+            lbLog("DEBUG", "send channel #4: clicking site send button despite disabled state",
+                  { label: (btn2.getAttribute("aria-label") || btn2.textContent || "").trim().slice(0, 30),
+                    reactChars: rvNow === null ? -1 : rvNow.length, domChars: readBox(el).length });
             dispatchClick(btn2);
-            if (await waitBoxEmptied(el, 2500)) submitted = true;
+            if (!(await waitBoxEmptied(el, 2500))) {
+              if (invokeReactHandler(btn2, "onClick") || invokeReactHandler(btn2, "onSubmit")) {
+                submitted = await waitBoxEmptied(el, 2000);
+              }
+            } else submitted = true;
           }
         }
       }
@@ -590,7 +794,16 @@ if (!CFG) {
     // then insert SMALL CHUNKS at the caret via executed beforeinput /
     // execCommand so React commits state between chunks. ~30× faster and the
     // text lands in order.
-    if (!submitted && readBox(el).trim()) {
+    // v0.9.11 CPU FIX: but even chunked, retyping a multi-thousand-char prompt
+    // fires hundreds of synchronous mutation+React-commit cycles while the
+    // engine is ALSO cooling down and re-dispatching the same prompt — that is
+    // the "high CPU usage, no progress" state in the user log of 2026-10-16
+    // 00:31. If the box ALREADY contains our exact text (the common DeepSeek
+    // failure mode: injection landed, only the SUBMIT failed), re-typing it
+    // char-by-char achieves nothing — skip straight to settle + ghost-send
+    // detection and let the new channels below do the submitting.
+    const alreadyTyped = norm(readBox(el)) === norm(text);
+    if (!submitted && readBox(el).trim() && !alreadyTyped) {
       lbLog("WARN", "button/submit/Enter all failed — chunked caret retype", { remaining: readBox(el).trim().slice(0, 40) });
       await activateSelf("retype");                   // needs real focus most of all
       try {
@@ -647,6 +860,33 @@ if (!CFG) {
           if (isCE(el)) { try { document.execCommand("selectAll"); document.execCommand("delete"); } catch {} }
           el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
         } catch {}
+        submitted = true;
+      }
+    }
+    // v0.9.11: LAST-RESORT SUBMIT — invoke the app's own handlers directly.
+    // Everything above dispatches synthetic DOM events, which DeepSeek's
+    // current composer ignores (React delegation + trusted-event guards; see
+    // the 00:31 log where Ctrl/plain/Meta Enters all landed with no effect).
+    // Before flushing and failing, walk the fiber chains of the input, its
+    // form/ancestors, and the send button and CALL onClick/onSubmit/onKeyDown
+    // props ourselves. This is the only channel that bypasses event plumbing
+    // entirely; each invocation is wrapped in try/catch and re-checks the box.
+    if (!submitted && readBox(el).trim()) {
+      lbLog("WARN", "final-resort: invoking React handlers directly (fiber props)", { chars: readBox(el).trim().length });
+      const targets = [el];
+      for (let n = el.parentElement, d = 0; n && d < 5; n = n.parentElement, d++) targets.push(n);
+      const btn3 = findSendButton(document, { allowDisabled: true });
+      if (btn3) targets.unshift(btn3);
+      for (const t of targets) {
+        if (submitted) break;
+        for (const prop of ["onClick", "onSubmit", "onKeyDown"]) {
+          if (invokeReactHandler(t, prop)) {
+            if (await waitBoxEmptied(el, 2000)) { submitted = true; break; }
+          }
+        }
+      }
+      if (!submitted && await confirmGenerationStarted(baseline)) {
+        lbLog("WARN", "generation started despite jammed box — treating turn as submitted");
         submitted = true;
       }
     }
@@ -722,6 +962,16 @@ if (!CFG) {
   // button at all — with only signal (a) we waited 6s every hop and then raced
   // the stream; that caused both the slowness AND truncated captures like
   // "It appears your chat interface is caught in".
+  // v0.9.11: final-resort confirmation used by say() when every send channel
+  // reports failure but the box state is ambiguous. If a NEW assistant bubble
+  // appeared (or the last one started growing behind a stop button), the site
+  // DID accept our message even though the composer looks jammed — treat the
+  // turn as submitted instead of flushing/re-failing it. Thin wrapper over
+  // waitForStart's proven start-detection logic.
+  async function confirmGenerationStarted(baseline) {
+    return waitForStart(5000, baseline);
+  }
+
   async function waitForStart(maxMs = 15000, baseline = -1) {
     const t0 = Date.now();
     if (baseline < 0) baseline = assistantNodes().length;

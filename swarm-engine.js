@@ -218,6 +218,7 @@ function coolDown(seconds) {
 }
 
 let retrying = false;
+const impassStrikes = {};   // v0.9.12: per-agent "(no response captured)" re-dispatch counter (bounded)
 // v0.9.2: promise-based attempt tracking. The old boolean flag was set by
 // ANY frame that touched it (including a queued say merely being accepted),
 // so cool-down retries could be declared "successful" without a real reply,
@@ -422,11 +423,42 @@ function onReply(msg, fromName) {
   }
   clearTimeout(ENGINE.timers.reply);                  // fresh prompt gets its own watchdog
   ENGINE.timers.reply = null;
-  ENGINE.transcript.push({ role: captured ? "assistant" : "error", agent: fromName,
-                           text, ts: Date.now(), captured });
+  // v0.9.12 (user log 2026-10-16 00:46:21): a bridge that captured nothing
+  // used to relay the literal placeholder "(no response captured)" as if it
+  // were the agent's answer — poisoning the thread and making the next hop
+  // respond to a non-answer. Treat it as a FAILED capture: don't record it,
+  // don't count the turn, don't hand garbage to the partner; let the retry
+  // path re-dispatch the original prompt after a cool-down.
   ENGINE.turnCount += 1;
   engLog(captured ? "INFO" : "WARN", `turn #${ENGINE.turnCount} ${captured ? "complete" : "FAILED"} :: ${fromName}`,
          { chars: text.length, preview: text.slice(0, 60) });
+  if (captured && text.trim() === "(no response captured)") {
+    ENGINE.turnCount -= 1;                            // not a real completed turn
+    // v0.9.12 BOUND: the bridge already retried the capture once on its side;
+    // let the engine re-dispatch at most twice more, then record an honest
+    // error line and hand the run to the partner instead of looping forever
+    // (prevents a placeholder ping-pong between two agents).
+    impassStrikes[fromName] = (impassStrikes[fromName] || 0) + 1;
+    if (impassStrikes[fromName] > 2) {
+      engLog("ERROR", `${fromName} could not capture a reply after retries — skipping this hop`,
+             { strikes: impassStrikes[fromName] });
+      impassStrikes[fromName] = 0;
+      ENGINE.transcript.push({ role: "error", agent: fromName,
+                               text: `(capture failed for ${fromName} — hop skipped)`, ts: Date.now(), captured: false });
+      const nxt = ENGINE.partnerOf[fromName] || [...ENGINE.agents.keys()].find(n => n !== fromName);
+      if (!nxt) { finishRun("no-partner"); return; }
+      ENGINE.current = nxt;
+      sendPromptToCurrent(ENGINE.lastText || "Please continue the thread.");
+      broadcastState();
+      return;
+    }
+    engLog("WARN", `turn on ${fromName} captured no reply — re-dispatching instead of relaying placeholder`,
+           { chars: text.length, strike: impassStrikes[fromName] });
+    handleFailedTurn(fromName);
+    return;
+  }
+  ENGINE.transcript.push({ role: captured ? "assistant" : "error", agent: fromName,
+                           text, ts: Date.now(), captured });
   if (ENGINE.turnCount >= ENGINE.turns * 2) { finishRun("turn-budget"); return; }
   // hand the reply to the partner agent (strict alternation)
   const next = ENGINE.partnerOf[fromName] || [...ENGINE.agents.keys()].find(n => n !== fromName);

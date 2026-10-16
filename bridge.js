@@ -891,6 +891,31 @@ if (!CFG) {
       }
     }
     if (!submitted) {
+      // v0.9.12 CRITICAL GUARD (user log 2026-10-16 00:46:21): qwen's turn #4
+      // was reported as a 22-char "(no response captured)" exactly ~20 s after
+      // the previous hop — impossible for a real generation. Root cause: when
+      // every send channel appeared to fail, the old code FLUSHED the composer
+      // before probing the page. DeepSeek/qwen clear their textarea
+      // asynchronously AFTER accepting the message (ghost-send behaviour seen
+      // at 00:31 and 19:33); our deleteContentBackward event then raced that
+      // confirmation and produced a false "not submitted" verdict — which both
+      // destroyed evidence and cancelled a live generation via the retry path.
+      // New order: (1) fresh ghost check, (2) wait for a NEW assistant bubble /
+      // stop button against the baseline, (3) only THEN flush + report failure.
+      const ghostNow = detectGhostSend(el, text, baseline);
+      if (ghostNow) {
+        lbLog("WARN", "late GHOST SEND confirmed before flush — treating turn as submitted");
+        submitted = true;
+      }
+    }
+    if (!submitted) {
+      const genStarted = await confirmGenerationStarted(baseline);
+      if (genStarted) {
+        lbLog("WARN", "new assistant content appeared despite full composer — treating turn as submitted");
+        submitted = true;
+      }
+    }
+    if (!submitted) {
       // v0.9.4: the message truly did not go out. Flush the editor NOW —
       // leaving 1.8k chars sitting in the composer made every later retry and
       // the next turn's injection fight a jammed box (the 19:33–19:36 spiral).
@@ -1232,6 +1257,7 @@ if (!CFG) {
     hud("writing…");
     let textToSay = String(text);
     let textP = "(no response captured)";
+    let impassRetried = false;                         // v0.9.12: one bounded capture retry per turn
     try {
       for (;;) {
         const baseline = assistantNodes().length;      // bubble count BEFORE send
@@ -1240,6 +1266,28 @@ if (!CFG) {
         await waitForStart(15000, baseline);           // stop button OR new bubble
         await waitForIdle();
         textP = await captureReply(baseline);          // + truncation re-check
+        // v0.9.12 IMPASS-RETRY GUARD (user log 2026-10-16 00:46:21): turn #4
+        // on qwen relayed the bare 22-char placeholder "(no response captured)"
+        // to the swarm after only ~20 s — an impossible generation time that
+        // poisoned the debate with a non-answer. The old loop only retried when
+        // a queued say was pending, so the placeholder went straight through as
+        // the "reply". Now: one bounded retry (re-send the same prompt once)
+        // before accepting failure; if it still fails, report honestly via
+        // send_failed-style error so the engine cool-down/re-dispatch owns the
+        // hop instead of relaying garbage to the partner agent.
+        if (textP === "(no response captured)" && !state.halted) {
+          if (!impassRetried) {
+            impassRetried = true;
+            lbLog("WARN", "capture impass — retrying this hop once before reporting failure",
+                  { seconds: +((performance.now() - t0) / 1000).toFixed(1) });
+            await sleep(3000);                         // let any late stream settle first
+            continue;
+          }
+          lbLog("ERROR", "capture impass persists after retry — reporting FAILED turn (not relaying placeholder)",
+                { preview: textToSay.trim().slice(0, 60) });
+          try { transport?.send({ type: "send_failed", agent: CFG.name, preview: "CAPTURE-IMPASS: " + textToSay.trim().slice(0, 60) }); } catch {}
+          throw new Error("LLM Bridge: no response captured after retry");
+        }
         if (textP !== "(no response captured)" || !pendingSay) break;
         textToSay = pendingSay;                        // failed phantom turn — resend what we have queued
         pendingSay = null;

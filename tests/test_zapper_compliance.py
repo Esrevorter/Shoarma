@@ -35,7 +35,8 @@ def strip_comments(text):
 
 
 # ── sources under scan ────────────────────────────────────────────────────────
-TARGETS = ["background.js"]
+TARGETS = ["background.js", "bridge.js", "swarm-engine.js", "monitor.js", "popup.js"]
+WORKER_TARGETS = {"background.js", "swarm-engine.js"}
 
 for rel in TARGETS:
     src = (ROOT / rel).read_text(encoding="utf-8")
@@ -52,11 +53,16 @@ for rel in TARGETS:
                    if re.search(r"(?<![=!<>])={2}(?!=)|(?<![=!<>])!=(?!=)", line)):
             print(f"   line ~{ln}")
 
-    # 2. guards exist and unhandled-rejection shield registered
-    check(f"{rel}: asPromise() defined", "function asPromise(v)" in src)
-    check(f"{rel}: safeCatch() defined", "function safeCatch(p" in src)
-    check(f"{rel}: unhandledrejection shield",
-          'self.addEventListener("unhandledrejection"' in src)
+    # 2. guards exist and unhandled-rejection shield registered — only for
+    #    worker-context sources (background/engine), which use promise-style
+    #    chrome.* APIs. Content/UI scripts (bridge/monitor/popup) reach
+    #    chrome.* only via awaited async calls inside try/catch, so the
+    #    asPromise/safeCatch/shield checks do not apply to them.
+    if rel in WORKER_TARGETS:
+        check(f"{rel}: asPromise() defined", "function asPromise(v)" in src)
+        check(f"{rel}: safeCatch() defined", "function safeCatch(p" in src)
+        check(f"{rel}: unhandledrejection shield",
+              'self.addEventListener("unhandledrejection"' in src)
 
     # 3. no direct .then/.catch chained onto a chrome.* call
     viol = [m.group(0)[:70] for m in re.finditer(

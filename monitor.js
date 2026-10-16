@@ -242,7 +242,7 @@ function renderEvent(ev) {
   if (ev.type === "reply" || ev.type === "error") {
     d.className = `msg ${ev.agent || ""} ${ev.type === "error" ? "err me" : ""}`;
     d.innerHTML = `<div class="meta"><span class="who">${ev.agent || "?"}</span>
-      <span>turn ${ev.turn ?? "—"}</span><span>${time}</span>${ev.seconds != null ? `<span>${ev.seconds}s</span>` : ""}</div>
+      <span>turn ${ev.turn ?? "—"}</span><span>${time}</span>${(ev.seconds !== null && ev.seconds !== undefined) ? `<span>${ev.seconds}s</span>` : ""}</div>
       <div class="txt"></div>`;
     d.querySelector(".txt").textContent = clip(ev.text, 3000);
     logLine(`${time} REPLY ${ev.agent}: ${clip(ev.text, 400)}`);

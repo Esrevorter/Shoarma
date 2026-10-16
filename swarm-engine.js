@@ -529,7 +529,7 @@ function downloadLastTranscript() {
     const blob = new Blob([JSON.stringify(lastTranscript, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     chrome.downloads.download({ url, filename: `shoarma-transcript-${Date.now()}.json`, saveAs: true },
-      (id) => { if (id != null) setTimeout(() => URL.revokeObjectURL(url), 60_000); });
+      (id) => { if (id !== null && id !== undefined) setTimeout(() => URL.revokeObjectURL(url), 60_000); });
   });
 }
 
@@ -652,7 +652,7 @@ async function focusTab(tabId) {
   lastFocus = { tabId, ts: now };
   let tab = await chrome.tabs.get(tabId);
   if (!tab.active) await chrome.tabs.update(tabId, { active: true });
-  if (tab.windowId != null) { try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {} }
+  if (tab.windowId !== null && tab.windowId !== undefined) { try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {} }
   const t0 = Date.now();
   while (Date.now() - t0 < 3000) {
     try { tab = await chrome.tabs.get(tabId); } catch { break; }
@@ -664,7 +664,7 @@ async function focusTab(tabId) {
 // ── badge: how many agent tabs are alive ────────────────────────────────────
 const liveTabs = new Set();
 function bumpBadge(tabId) {
-  if (tabId != null) liveTabs.add(tabId);
+  if (tabId !== null && tabId !== undefined) liveTabs.add(tabId);
   // v0.9.6 guard: chrome.action is undefined in some contexts (e.g. the node
   // recovery-test harness). A throw here would kill the worker mid-message —
   // exactly the class of bug that made arm() "fail" with a phantom error.

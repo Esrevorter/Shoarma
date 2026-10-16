@@ -253,7 +253,7 @@ if (!CFG) {
             for (const key of Object.keys(p)) {
               if (/^on(KeyDown|KeyDownCapture|Submit)$|shortcut/i.test(key)) scan(p[key]);
             }
-            if (p.sendShortcut != null) scan({ sendShortcut: p.sendShortcut });
+            if (p.sendShortcut !== null && p.sendShortcut !== undefined) scan({ sendShortcut: p.sendShortcut });
           }
           node = node.return;
         }

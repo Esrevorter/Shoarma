@@ -177,6 +177,7 @@ function arm(topic, turns, timeout) {
   ENGINE.timeout = Math.min(Math.max(Number(timeout) || 180, 15), 600);
   ENGINE.transcript = [];
   ENGINE.turnCount = 0;
+  ENGINE.retryCount = 0;                              // v0.9.17: per-run broken-record budget (one re-dispatch max)
   ENGINE.startedAt = Date.now();
   const names = [...ENGINE.agents.keys()].sort();
   if (names.length < 2) {
@@ -213,6 +214,7 @@ function sendPromptToCurrent(text) {
   const to = ENGINE.current;
   if (!to || !ENGINE.agents.has(to)) { finishRun("target agent vanished"); return; }
   ENGINE.lastText = text;
+  ENGINE.retryCount = 0;                              // v0.9.17: fresh prompt gets a fresh one-retry budget
   deliver(to, { type: "say", text });
   armReplyTimeout();
 }
@@ -321,7 +323,32 @@ async function handleFailedTurn(fromName) {
         return;
       }
       releaseAgent(ENGINE.current);
-      engLog("INFO", `re-dispatching current prompt to ${ENGINE.current}`, { after: wait + "s" });
+      // v0.9.17 SELF-HEAL / BROKEN-RECORD GUARD (user log 2026-10-17 03:29→03:37):
+      // qwen's composer intermittently accepted sends only via the destructive
+      // final-resort path, so each retry cost ~85 s of channel hammering; the
+      // engine then re-injected the SAME prompt up to 2x per turn — a full
+      // re-send spiral that ended in "MESSAGE NOT SUBMITTED" after 8 minutes.
+      // Per-prompt budget: at most ONE re-dispatch. A second failure means the
+      // site is not accepting this prompt right now; record an honest error
+      // line and hand off to the partner agent instead of looping. The run
+      // continues with fresh content and the broken hop surfaces in the feed.
+      ENGINE.retryCount = (ENGINE.retryCount || 0) + 1;
+      if (ENGINE.retryCount > 1) {
+        engLog("ERROR", `prompt failed ${ENGINE.retryCount}x — skipping this hop instead of re-sending forever`,
+               { failedAgent, chars: String(ENGINE.lastText || "").length });
+        retrying = false;                              // release the flag before mutating state
+        _attemptPromise = null;
+        settleAttempt(false);
+        ENGINE.transcript.push({ role: "error", agent: failedAgent,
+                                 text: `(send failed for ${failedAgent} — hop skipped)`, ts: Date.now(), captured: false });
+        const nxt = ENGINE.partnerOf[failedAgent] || [...ENGINE.agents.keys()].find(n => n !== failedAgent);
+        if (!nxt) { finishRun("no-partner"); return; }
+        ENGINE.current = nxt;
+        sendPromptToCurrent(ENGINE.lastText || "Please continue the thread.");
+        broadcastState();
+        return;
+      }
+      engLog("INFO", `re-dispatching current prompt to ${ENGINE.current}`, { after: wait + "s", attempt: ENGINE.retryCount });
       const okP = new Promise((res) => { _attemptResolve = res; });
       _attemptPromise = okP;
       deliver(ENGINE.current, { type: "say", text: ENGINE.lastText });

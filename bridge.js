@@ -618,6 +618,14 @@ if (!CFG) {
   // v0.8: qwen's collapsed-reasoning header reads "Thinking completed" and was
   // captured as a whole reply (user log 10:48:07/10:48:32). Treat it as chrome.
   const CHROME_EXACT = /^(thinking completed|deep thinking|analyzing\.\.\.|stop|new chat|scroll to top)[\s.!…]*$/i;
+  // v0.9.17 (user log 2026-10-17 03:36:11): the preference-bar labels themselves
+  // ("I prefer this response" x2) matched [class*="markdown"] on qwen, became the
+  // ONLY candidates after stale/echo guards ran, and turned a real 22 k-char
+  // generation into a capture impass -> retry -> re-send spiral. The old filter
+  // required len<60 AND no trailing sentence punctuation; these labels end with
+  // "." so they slipped through. Any string composed ENTIRELY of known UI
+  // vocabulary is chrome regardless of length or punctuation.
+  const CHROME_WORD = /^(i|prefer|this|response|answer|reply|good|bad|great|nice|thumbs|up|down|copy|copied|regenerate|retry|try again|edit|like|dislike|share|export|continue|stop|new chat|scroll to top|thinking completed|deep thinking|analyzing|loading|please wait)\.?$/i;
   let lastSentText = "";
   let lastCapturedNorm = "";                          // v0.8.3: stale-reply guard
   const norm = (s) => String(s).replace(/\s+/g, " ").trim().toLowerCase();
@@ -1190,6 +1198,19 @@ if (!CFG) {
       const again = lastAssistantText(baseline);
       if (again.length > text.length) { lbLog("INFO", "longer capture after liveness re-check", { was: text.length, now: again.length }); text = again; }
     }
+    // v0.9.17 SELF-HEAL (user log 2026-10-17 03:36:11): a big prompt (22 k chars)
+    // triggered qwen's "Which response do you prefer?" A/B panel. Its markdown
+    // containers held only the two preference labels, so capture looked like an
+    // impass while the real answer streamed in the background (settled at
+    // 03:36:07 with 22047 chars). One bounded extra settle window before even
+    // considering the retry path turns that into a clean capture.
+    if (text === "(no response captured)" && baseline >= 0 && assistantNodes().length <= baseline) {
+      lbLog("WARN", "no new bubble yet despite settled stream — one extended settle pass before retrying",
+            { baseline, now: assistantNodes().length });
+      await waitForIdle({ quietMs: 1500, timeoutMs: 20000 });
+      const t2 = lastAssistantText(baseline);
+      if (t2 !== "(no response captured)") return t2;
+    }
     if (text === "(no response captured)") {          // maybe the gate just opened late
       if (await confirmGate()) {
         await waitForIdle({ quietMs: 900, timeoutMs: 25000 });
@@ -1210,6 +1231,13 @@ if (!CFG) {
     // 14:57/15:05). Treat them as chrome so the orchestrator retries the hop.
     if (/^oops!?\b/i.test(t.trim()) || /was an issue connecting|service is currently exhausted|rate.?limit/i.test(t)) return true;
     if (/^(thinking|deep thinking|analyzing)\b.{0,30}$/i.test(t.trim())) return true;
+    // v0.9.17: whole-string UI-vocabulary test — "I prefer this response." and
+    // any dot/space-padded variant is chrome regardless of trailing punctuation,
+    // but only for SHORT strings (<120 chars) so repetitive real prose survives.
+    {
+      const words = t.trim().split(/\s+/);
+      if (t.trim().length < 120 && words.length >= 2 && words.every(w => CHROME_WORD.test(w))) return true;
+    }
     return t.length < 60 && CHROME_HINT.test(t) && !/[.!?…]"']$/.test(t);
   }
   // v0.6 CONFIRM STEP — qwen's "which response do you prefer?" gate leaves a

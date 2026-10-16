@@ -286,4 +286,4 @@ $("copy").onclick = async () => {
   $("copy").classList.add("ok-flash"); $("copy").textContent = "✓ copied — paste it to the agent";
   setTimeout(() => { $("copy").classList.remove("ok-flash"); $("copy").textContent = "📋 Copy debug"; }, 2500);
 };
-$("clear").onclick = () => { $("feed").innerHTML = ""; DEBUG_LINES = []; lastSeq = lastSeq; };
+$("clear").onclick = () => { $("feed").innerHTML = ""; DEBUG_LINES = []; lastSeq = 0; };  // v0.9.12: was a no-op (lastSeq = lastSeq) — cleared feed then the poller skipped every event with seq < old lastSeq → monitor looked dead/empty

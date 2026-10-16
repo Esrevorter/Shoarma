@@ -24,6 +24,7 @@ const ENGINE = {
   turnCount: 0,
   transcript: [],           // {role, agent, text, ts, captured}
   timers: {},               // named setTimeout ids we can cancel
+  lastRunEndedAt: 0,        // v0.9.14: Date.now() stamp set by finishRun(); guards onRegister
 };
 
 const TOPIC_FALLBACK =
@@ -357,6 +358,20 @@ function settleAttempt(v) { try { _attemptResolve?.(v); } catch {} _attemptResol
 
 // ── what bridges send us ───────────────────────────────────────────────────
 
+// v0.9.14 BUGFIX (D7 deterministic repro): after a run finishes, finishRun()
+// schedules state "done" -> "idle" 8 s later, and settleAttempt(true) leaves
+// _attemptPromise === DONE_OK as a sticky sentinel. Bridge tabs that re-
+// register right after the run (tab restore / SW restart / bridge reconnect)
+// used to trip `state === "idle" && agents.size >= 2` and AUTO-ARM with the
+// stale ENGINE.topic — ghost-seeding the last topic into fresh chat tabs
+// (the stale "until next time" replies in the user's logs) and resetting the
+// orchestrator feed sequence, which broke monitor dedupe (ev.seq > lastSeq).
+// Auto-arm is now allowed ONLY for a genuine cold start (no run has ever
+// ended in this engine instance) or when the idle window after the previous
+// run has fully elapsed (> 8 s, i.e. past the done->idle transition). An
+// explicit user action ("start"/"arm" messages, case "start"/"arm" below)
+// still arms immediately regardless of the stamp.
+const POST_RUN_REARM_WINDOW_MS = 8000;                // mirrors the done->idle timer in finishRun()
 function onRegister(msg, senderTabId) {
   const name = String(msg.agent || "").toLowerCase();
   if (!name) return;
@@ -364,8 +379,18 @@ function onRegister(msg, senderTabId) {
   ENGINE.agents.set(name, { tabId: senderTabId, ready: true, busy: !!prev?.busy, queue: [] });
   engLog("INFO", `agent registered: ${name}`, { tabId: senderTabId });
   try { chrome.tabs.sendMessage(senderTabId, { type: "registered", agent: name }); } catch {}
-  if (ENGINE.state === "idle" && ENGINE.agents.size >= 2) arm(ENGINE.topic || "", ENGINE.turns, ENGINE.timeout);
-  else broadcastState();
+  if (ENGINE.state === "idle" && ENGINE.agents.size >= 2) {
+    const coldStart = ENGINE.lastRunEndedAt === 0;
+    const windowElapsed = Date.now() - ENGINE.lastRunEndedAt > POST_RUN_REARM_WINDOW_MS;
+    if (coldStart || windowElapsed) {
+      arm(ENGINE.topic || "", ENGINE.turns, ENGINE.timeout);
+    } else {
+      engLog("INFO", `post-run re-register from ${name} — auto-arm suppressed (run ended ${Date.now() - ENGINE.lastRunEndedAt} ms ago; use Start to begin a new run)`);
+      broadcastState();
+    }
+  } else {
+    broadcastState();
+  }
 }
 
 function onReply(msg, fromName) {
@@ -501,6 +526,7 @@ function haltAll(reason) {
 function finishRun(reason) {
   clearTimeout(ENGINE.timers.reply);
   ENGINE.state = "done";
+  ENGINE.lastRunEndedAt = Date.now();                 // v0.9.14: post-run guard for onRegister auto-arm
   engLog("INFO", `run finished (${reason}) — ${ENGINE.transcript.length} entries`,
          { turns: ENGINE.turnCount });
   persistTranscript();

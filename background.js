@@ -9,7 +9,7 @@
 const HOST = "com.shoarma.launcher";
 
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-  if (msg?.type === "launch") { launch().then(respond); return true; }
+  // NOTE: "launch" is handled further below with the retired-launcher answer.
   if (msg?.type === "log") {                           // bridge debug → console
     const e = msg.entry || {};
     (e.level === "ERROR" ? console.warn : console.log)(`[Shoarma ${e.agent}] ${e.level}: ${e.msg}`, e.data ?? "");
@@ -21,13 +21,37 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   // its own tab to the foreground — fully automated, no user interaction.
   if (msg?.type === "activate-tab") {
     const tabId = sender.tab?.id;
-    if (tabId == null) { respond({ ok: false, error: "no tab" }); return false; }
-    focusTab(tabId).then(
-      () => respond({ ok: true }),
-      (e) => respond({ ok: false, error: String(e && e.message || e) })
-    );
+    if (tabId === undefined || tabId === null) { respond({ ok: false, error: "no tab" }); return false; }
+    // v0.9.11 (ZAPPER.md): promise-safe chaining — a host environment that
+    // hands back a non-Promise must never kill the worker with
+    // "Cannot read properties of undefined (reading 'then')".
+    asPromise(focusTab(tabId))
+      .then(() => respond({ ok: true }))
+      .catch((e) => respond({ ok: false, error: String(e && e.message || e) }));
     return true;
   }
+  // v0.9.11 (ZAPPER.md): legacy launch path mirrored from swarm-engine.js —
+  // the native launcher is retired in v0.9; answer honestly instead of
+  // attempting a native call that would reject unhandled.
+  if (msg?.type === "launch") {
+    respond({ ok: false, error: "Native launcher is retired in v0.9 — switch the Orchestrator selector to 🌐 In-browser engine, or run `python orchestrator.py` manually for remote mode." });
+    return false;
+  }
+});
+
+// ── v0.9.11 (ZAPPER.md): promise-safe guards ────────────────────────────────
+// Same contract as swarm-engine.js asPromise()/safeCatch(): never chain
+// .then/.catch directly onto a value that might not be a Promise, and never
+// let a rejection pass silently.
+function asPromise(v) {
+  if (v && typeof v.then === "function") return v;
+  return Promise.resolve(v);
+}
+function safeCatch(p, onError) {
+  asPromise(p).catch((e) => { try { onError(e); } catch {} });
+}
+self.addEventListener("unhandledrejection", (ev) => {
+  console.warn("[Shoarma bg] unhandled rejection:", ev.reason);
 });
 
 let lastFocus = { tabId: -1, ts: 0 };
@@ -35,27 +59,18 @@ async function focusTab(tabId) {
   const now = Date.now();
   if (tabId === lastFocus.tabId && now - lastFocus.ts < 400) return;  // already focused
   lastFocus = { tabId, ts: now };
-  const tab = await chrome.tabs.get(tabId);
+  const tab = await asPromise(chrome.tabs.get(tabId));
   if (!tab.active) {
-    await chrome.tabs.update(tabId, { active: true });
+    await asPromise(chrome.tabs.update(tabId, { active: true }));
   }
-  if (tab.windowId != null) {
+  if (tab.windowId !== undefined && tab.windowId !== null) {
     try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {}
   }
 }
 
-async function launch() {
-  const cfg = await chrome.storage.sync.get({ turns: 6, timeout: 180, port: 8765, topic: "" });
-  try {
-    const port = chrome.runtime.sendNativeMessage(HOST, cfg);
-    const res = await port;
-    return res?.ok
-      ? { ok: true, pid: res.pid }
-      : { ok: false, error: res?.error || "Launcher refused the request." };
-  } catch (e) {
-    return { ok: false, error: nativeHelp(String(e)) };
-  }
-}
+// `launch()` is intentionally NOT defined anymore (v0.9.11): the native
+// launcher is retired and the listener answers "launch" with the friendly
+// rejection directly, so no dead code hides an unhandled native call.
 
 function nativeHelp(err) {
   if (!/not found|Specified native messaging host not found|native host/i.test(err)) {
@@ -73,7 +88,7 @@ function nativeHelp(err) {
 // ── badge ───────────────────────────────────────────────────────────────────
 const live = new Set();
 function bumpBadge(tabId) {
-  if (tabId != null) live.add(tabId);
+  if (tabId !== undefined && tabId !== null) live.add(tabId);
   chrome.action.setBadgeText({ text: live.size ? String(live.size) : "" });
   chrome.action.setBadgeBackgroundColor({ color: "#4cc9f0" });
 }

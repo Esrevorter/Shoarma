@@ -87,6 +87,7 @@ if (!CFG) {
   const state = { halted: false, ws: null, turns: 0, lastMs: 0, lastState: "connecting" };
   let busy = false;                                   // v0.8.3: single-flight turn guard
   let pendingSay = null;                              // v0.8.3: newest say queued while busy
+  let pendingSayAckQueued = false;                    // v0.9.15: say accepted → ACK queued:true (see handleOrchestratorFrame)
 
   // ── Monitor feed (v0.4): the orchestrator mirrors everything into a Hub that
   //    the third-page live monitor polls. We push HUD state changes upstream so
@@ -210,13 +211,22 @@ if (!CFG) {
   // (React fiber props / on-key-down handlers) so we fire the exact combo
   // the app actually listens for instead of guessing.
   function pressEnter(el, mods = {}) {
+    // v0.9.15: `isComposing: true` on the beforeinput probe. DeepSeek's
+    // composer (and other React chat editors) gate Enter handling on IME
+    // composition state; a plain historyForward beforeinput is swallowed by
+    // their onCompositionEnd/onBeforeInput plumbing, so our Enter sequence
+    // never reached the app-level submit handler (user log 2026-10-17 02:49:
+    // Ctrl/plain/Meta all landed with zero effect while the box stayed full).
+    // Marking the probe as composing routes it through the same branch a real
+    // Enter-with-pending-composition takes; harmless on editors without an
+    // IME path — every subsequent channel still runs unchanged.
     const base = {
       key: "Enter", code: "Enter", keyCode: 13, which: 13, charCode: 13,
       ctrlKey: !!mods.ctrl, metaKey: !!mods.meta, shiftKey: !!mods.shift,
       altKey: !!mods.alt,
       bubbles: true, cancelable: true, composed: true,
     };
-    try { el.dispatchEvent(new InputEvent("beforeinput", { ...base, inputType: "historyForward" })); } catch {}
+    try { el.dispatchEvent(new InputEvent("beforeinput", { ...base, inputType: "historyForward", isComposing: true })); } catch {}
     el.dispatchEvent(new KeyboardEvent("keydown", base));
     el.dispatchEvent(new KeyboardEvent("keypress", base));
     el.dispatchEvent(new KeyboardEvent("keyup", base));
@@ -460,6 +470,62 @@ if (!CFG) {
       }
     } catch {}
     return null;                                       // no fiber found — unknown
+  }
+
+  // ── v0.9.15: React CONTAINER state probe ──────────────────────────────────
+  // reactValueOf() walks the fiber chain looking for a `value` STRING prop —
+  // which works for classic controlled <textarea>s but reads null/"" on sites
+  // that keep composer text in component STATE (useState) or in a ref-backed
+  // editor model. DeepSeek's current build is exactly that: user log
+  // 2026-10-17 02:49 shows all Enter channels firing with detected:false,
+  // every send attempt leaving 776 chars in the box, and NO "react state ok"
+  // debug line — our injection updated the DOM but never the app's own model,
+  // so its submit handlers believed the composer was empty and bailed.
+  // This probe scans memoizedState hooks chains (and props carrying our text)
+  // up the fiber tree from `el`, returning the number of ancestors whose live
+  // state/props verifiably contain `text`. >0 ⇒ React really holds our text
+  // and only SUBMIT is failing; 0 with a full-looking DOM ⇒ desync, and the
+  // correct remedy is the chunked caret retype (which routes through the
+  // site's own beforeinput pipeline), NOT more blind Enter presses.
+  function reactHoldsText(el, text) {
+    const want = norm(text);
+    if (!want) return -1;                              // nothing to match against
+    let hits = 0;
+    try {
+      for (const k of Object.keys(el)) {
+        if (!k.startsWith("__reactFiber$")) continue;
+        let node = el[k], hops = 0;
+        while (node && hops++ < 30) {
+          let matched = false;
+          for (const p of [node.memoizedProps, node.pendingProps]) {
+            if (!p || typeof p !== "object") continue;
+            for (const key of ["value", "text", "message", "inputValue", "draft"]) {
+              const v = p[key];
+              if (typeof v === "string" && norm(v) === want) { matched = true; break; }
+            }
+            if (matched) break;
+          }
+          if (!matched) {
+            let hook = node.memoizedState, hl = 0;     // useState/useReducer chain
+            while (hook && hl++ < 24) {
+              const s = hook.memoizedState;
+              if (typeof s === "string" && norm(s) === want) { matched = true; break; }
+              if (s && typeof s === "object") {
+                for (const v of Object.values(s)) {
+                  if (typeof v === "string" && norm(v) === want) { matched = true; break; }
+                }
+              }
+              if (matched) break;
+              hook = hook.next;
+            }
+          }
+          if (matched) hits++;
+          node = node.return;
+        }
+        break;                                          // one fiber root is enough
+      }
+    } catch {}
+    return hits;
   }
 
   // ── v0.9.11: direct React handler invocation ──────────────────────────────
@@ -803,8 +869,18 @@ if (!CFG) {
     // char-by-char achieves nothing — skip straight to settle + ghost-send
     // detection and let the new channels below do the submitting.
     const alreadyTyped = norm(readBox(el)) === norm(text);
-    if (!submitted && readBox(el).trim() && !alreadyTyped) {
-      lbLog("WARN", "button/submit/Enter all failed — chunked caret retype", { remaining: readBox(el).trim().slice(0, 40) });
+    // v0.9.15: second-opinion desync check. On builds where reactValueOf()
+    // can't see the composer model (useState/ref-backed editors — DeepSeek log
+    // 2026-10-17 02:49), the old `alreadyTyped` gate skipped the retype purely
+    // because the DOM text equalled our prompt, leaving us to hammer Enter at
+    // an app whose model was still EMPTY. If the fiber-state scan finds NO
+    // ancestor holding our text while the box looks full, force ONE bounded
+    // chunked-retype pass (the only injection route real chat editors accept).
+    const holds = reactHoldsText(el, text);
+    const stateDesynced = holds === 0 && !!readBox(el).trim();
+    if (!submitted && readBox(el).trim() && (!alreadyTyped || stateDesynced)) {
+      lbLog("WARN", "button/submit/Enter all failed — chunked caret retype",
+            { remaining: readBox(el).trim().slice(0, 40), stateFibers: holds, wasAlreadyTyped: alreadyTyped });
       await activateSelf("retype");                   // needs real focus most of all
       try {
         setNativeValue(el, "");                       // ONE clean clear
@@ -1338,6 +1414,33 @@ if (!CFG) {
       return;
     }
     if (msg.type === "resume") { lbLog("INFO", "orchestrator mid-run — tab rejoined"); hud("thinking…"); return; }
+    // v0.9.15: engine-driven composer reset. After a turn FAILS, DeepSeek's
+    // React model can still hold the old prompt even though say()'s flush
+    // cleared the DOM (user log 2026-10-17 02:49→02:50: first round fine,
+    // second round's injection lands in the DOM but every send channel fails
+    // because the app believes its stale text is still "in" the box). The
+    // engine now sends this frame before re-dispatching a failed turn; we
+    // clear DOM + fire the full input-event pipeline so React commits an
+    // empty state before the next say arrives.
+    if (msg.type === "reset_composer") {
+      // handleOrchestratorFrame is synchronous (the listener ACKs right after
+      // dispatch), so the settle check runs as a detached async chain.
+      (async () => {
+        try {
+          const el = findInput();
+          if (!el) { lbLog("DEBUG", "reset_composer: no input found"); return; }
+          setNativeValue(el, "");
+          if (isCE(el)) { try { document.execCommand("selectAll"); document.execCommand("delete"); } catch {} }
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          await sleep(150);                            // let React commit the empty state
+          const holdsAfter = reactHoldsText(el, lastSentText || "\u0000");
+          lbLog("INFO", "reset_composer: composer model reset before retry",
+                { domChars: readBox(el).trim().length, stateHoldsLastSent: holdsAfter });
+        } catch (e) { lbLog("WARN", "reset_composer failed", { err: String(e).slice(0, 100) }); }
+      })();
+      return;
+    }
     if (msg.type === "swarm") {                        // armed/running/done mirror
       state.swarm = msg.state;
       hudEl.querySelector("#lb-start").hidden = msg.state !== "armed";
@@ -1355,14 +1458,29 @@ if (!CFG) {
       return;
     }
     if (msg.type !== "say" || state.halted) { if (state.halted && msg.type === "say") lbLog("WARN", "dropping incoming say while HALTED", { preview: String(msg.text).slice(0, 60) }); return; }
+    // v0.9.15: single-flight ACK contract fix (DeepSeek log 2026-10-17 02:50:14).
+    // The runtime listener answers every frame with { ok:true, queued:busy }
+    // SYNCHRONOUSLY at dispatch time — for a say we START running, busy is
+    // still false when the engine's .then() reads it, so the engine never
+    // learns the turn is in flight. Combined with onSendFailure already
+    // releasing the agent, the two back-to-back send_failed/error frames from
+    // one failed turn each looked like a fresh failure and produced the double
+    // "bridge reports MESSAGE NOT SUBMITTED" + double re-dispatch. Now: any
+    // say that lands while we're idle gets queued:true in its response, which
+    // makes deliver() set a.busy immediately — the bridge owns the single
+    // flight from ACK onward, exactly like the mid-turn case.
+    if (msg.type === "say" && !busy) {                 // about to start a turn — claim it now
+      busy = true;                                     // (runTurn's finally releases as before)
+      runTurn(msg.text);
+      pendingSayAckQueued = true;                      // signal the outer listener to answer queued:true
+      return;
+    }
     if (busy) {                                        // v0.8.3: single-flight guard.
       lbLog("WARN", "say arrived while a turn is still in flight — queueing behind it",
             { preview: String(msg.text).slice(0, 40) });
       pendingSay = String(msg.text);                   // keep only the newest; older dupes were the retry storm
       return;
     }
-    busy = true;
-    runTurn(msg.text);
   }
 
   // ── Connection ─────────────────────────────────────────────────────────────
@@ -1410,9 +1528,15 @@ if (!CFG) {
   try {
     chrome.runtime.onMessage.addListener((m, _s, respond) => {
       if (!m) return;
-      if (["say", "swarm", "clear_input", "registered", "resume", "engine-log"].includes(m.type)) {
+      if (["say", "swarm", "clear_input", "registered", "resume", "engine-log", "reset_composer"].includes(m.type)) {
+        pendingSayAckQueued = false;                   // v0.9.15: fresh dispatch — clear last ACK flag
         handleOrchestratorFrame(m);
-        respond({ ok: true, queued: busy });
+        // v0.9.15: honest single-flight ACK. `queued` now means "a turn is
+        // owned by this bridge right now" — either it was already in flight,
+        // or handleOrchestratorFrame just claimed this say and started it.
+        // The engine's deliver() uses it to set a.busy BEFORE its own reply
+        // timer logic, killing the double-failure re-dispatch race.
+        respond({ ok: true, queued: busy || pendingSayAckQueued });
         return true;
       }
       if (m?.type === "halted" && typeof m.halted === "boolean" && m.reason !== "local") {

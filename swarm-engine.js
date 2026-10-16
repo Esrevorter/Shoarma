@@ -119,6 +119,26 @@ function deliver(name, frame) {
     }).catch(() => { /* tab gone — cleanup happens on next dispatch */ });
   };
   if (frame.type !== "say") { send(); return true; }
+  // v0.9.15: double-failure dedupe window (DeepSeek log 2026-10-17 02:50:14).
+  // ONE failed turn legitimately emits TWO frames within the same millisecond:
+  // say()'s explicit `send_failed` transport frame, then runTurn's catch sends
+  // an `error` frame — and handleEngineMessage routes BOTH into
+  // onSendFailure → handleFailedTurn. The first releases deepseek and starts
+  // the 5 s cool-down; the second found it idle again and logged a duplicate
+  // "bridge reports MESSAGE NOT SUBMITTED". A reply timer armed by the retry
+  // loop masks this today, but during the pre-cool-down adopt check there is no
+  // timer yet, so the duplicate slips through. Dedupe: while we are mid-run,
+  // still waiting on THIS attempt (_attemptPromise live), and no reply timer is
+  // armed (the exact signature of the second failure frame of one turn), drop
+  // the redundant report instead of re-entering the failure path. Genuine
+  // sequential failures arm their own timer before awaiting, so they never hit
+  // this guard.
+  if (frame.type === "send_failed" && ENGINE.state === "running"
+      && _attemptPromise && !ENGINE.timers.reply) {
+    engLog("DEBUG", `duplicate send_failed from ${name} while attempt already in flight — ignored`,
+           { preview: String(frame.text ?? frame.preview ?? "").slice(0, 40) });
+    return true;
+  }
   // v0.9.4: only a turn ACTUALLY IN FLIGHT counts as busy. The old flag could
   // be set by a say that merely got queued and never drain its release path
   // (e.g. the bridge threw before sending any frame), which produced the user
@@ -208,12 +228,19 @@ function armReplyTimeout() {
 }
 
 // cool-down between retries (v0.8.3): flush the jammed editor, wait, re-dispatch
+// v0.9.15: clear_input only resets the DOM value. On DeepSeek's current build
+// (user log 2026-10-17 02:49→02:50) the React composer MODEL kept holding the
+// failed prompt after the flush — the first round submitted fine, every send
+// channel of the second round then failed because the app believed its stale
+// state was still "in" the box. reset_composer additionally drives the full
+// input-event pipeline so the site commits an empty state before we retry.
 function coolDown(seconds) {
   return new Promise((res) => {
     for (const a of ENGINE.agents.values()) {
       try { chrome.tabs.sendMessage(a.tabId, { type: "clear_input" }); } catch {}
+      try { chrome.tabs.sendMessage(a.tabId, { type: "reset_composer" }); } catch {}
     }
-    engLog("WARN", `cool-down: flushed inputs, waiting ${seconds}s before retry`);
+    engLog("WARN", `cool-down: flushed inputs + reset composer models, waiting ${seconds}s before retry`);
     setTimeout(res, seconds * 1000);
   });
 }

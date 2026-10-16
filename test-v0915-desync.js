@@ -46,6 +46,9 @@ function fiberEl(fibers) {
 
 let passed = 0;
 function ok(label, cond) { assert.ok(cond, label); console.log("ok - " + label); passed++; }
+// v0.9.16: reactHoldsText returns {hits,looseHits} when >0, plain 0/-1 otherwise.
+// say() unwraps with `typeof holds === "object" ? holds.hits : holds` — mirror it.
+const hc = (r) => (typeof r === "object" ? r.hits : r);
 
 const PROMPT = "Imagine a world where the fundamental laws of physics are reversed.";
 
@@ -65,7 +68,7 @@ const PROMPT = "Imagine a world where the fundamental laws of physics are revers
       memoizedState: { memoizedState: "", next: { memoizedState: PROMPT } } },                    // useState<string> holding prompt
     { memoizedProps: { children: "Chat" }, memoizedState: null },
   ]);
-  ok("healthy state: hook-chain match counted (>0)", reactHoldsText(el, PROMPT) > 0);
+  ok("healthy state: hook-chain match counted (>0)", hc(reactHoldsText(el, PROMPT)) > 0);
 }
 
 // 3. Controlled-input props case: memoizedProps.value holds the text ⇒ >0
@@ -73,7 +76,7 @@ const PROMPT = "Imagine a world where the fundamental laws of physics are revers
   const el = fiberEl([
     { memoizedProps: { value: PROMPT, onChange() {} }, memoizedState: null },
   ]);
-  ok("healthy state: props.value match counted (>0)", reactHoldsText(el, PROMPT) > 0);
+  ok("healthy state: props.value match counted (>0)", hc(reactHoldsText(el, PROMPT)) > 0);
 }
 
 // 4. Whitespace/case normalization parity with say()'s alreadyTyped check
@@ -81,7 +84,7 @@ const PROMPT = "Imagine a world where the fundamental laws of physics are revers
   const el = fiberEl([
     { memoizedProps: { value: "  " + PROMPT.toUpperCase() + " \n" }, memoizedState: null },
   ]);
-  ok("normalization: whitespace+case-insensitive match still counted", reactHoldsText(el, PROMPT) > 0);
+  ok("normalization: whitespace+case-insensitive match still counted", hc(reactHoldsText(el, PROMPT)) > 0);
 }
 
 // 5. Empty query guard: nothing to match ⇒ -1 (never triggers the retype gate)
@@ -116,7 +119,7 @@ const PROMPT = "Imagine a world where the fundamental laws of physics are revers
     { memoizedProps: { value: PROMPT }, memoizedState: null },  // model STILL holds old prompt post-reset-DOM
   ]);
   ok("reset probe with \\u0000 sentinel reports stale-hold as 0 (informational field honest)",
-     reactHoldsText(el, "\u0000") === 0);
+     hc(reactHoldsText(el, "\u0000")) === 0);
 }
 
 // 9. Single-flight ACK pattern: queued = busy || pendingSayAckQueued, and the
@@ -141,6 +144,41 @@ const PROMPT = "Imagine a world where the fundamental laws of physics are revers
   busy = false;                                             // runTurn finally released
   const ack3 = deliverDispatch({ type: "clear_input" });
   ok("non-say frame cannot leak a stale queued:true once busy released", ack3.queued === false);
+}
+
+// ── v0.9.16: containment matching (user log 2026-10-17 03:00 — stateFibers:0
+//    false-negative forced a destructive retype even though the site model held
+//    our text under a slightly different representation) ──────────────────────
+{
+  const LONG = "Imagine a world where the fundamental laws of physics are reversed, and gravity pushes objects apart instead of pulling them together, making every structure unstable.";
+  // 10a. Site wraps our text in its own scaffolding ⇒ contains-match counted
+  const elWrap = fiberEl([
+    { memoizedProps: { value: "USER:\n" + LONG + "\n[send]" }, memoizedState: null },
+  ]);
+  ok("v0.9.16 containment: model string wrapping our text counts as a hit",
+     hc(elWrap && reactHoldsText(elWrap, LONG)) > 0);
+  const res = reactHoldsText(elWrap, LONG);
+  ok("v0.9.16 containment: reported as loose (not exact) so logs stay honest",
+     typeof res === "object" && res.hits === 1 && res.looseHits === 1);
+  // 10b. Model holds a TRIMMED variant (exact after norm) ⇒ exact hit
+  const elTrim = fiberEl([
+    { memoizedState: { memoizedState: "  " + LONG + "  " }, memoizedProps: {} },
+  ]);
+  const resT = reactHoldsText(elTrim, LONG);
+  ok("v0.9.16 whitespace variant is an EXACT hit (looseHits 0)",
+     typeof resT === "object" && resT.hits === 1 && resT.looseHits === 0);
+  // 10c. Short text must NOT contain-match (prevents 'hi' matching everything)
+  const elShort = fiberEl([
+    { memoizedProps: { value: "this is a much longer unrelated composer draft about hi story" }, memoizedState: null },
+  ]);
+  ok("v0.9.16 short query never contain-matches (gate stays closed on noise)",
+     reactHoldsText(elShort, "hi") === 0);
+  // 10d. Desync still proven-zero: unrelated model content ⇒ exactly 0 (number, not object)
+  const elDesync = fiberEl([
+    { memoizedProps: { value: "totally stale previous-round text ".repeat(4) }, memoizedState: { memoizedState: "" } },
+  ]);
+  ok("v0.9.16 genuine desync still returns numeric 0 (retype gate opens)",
+     reactHoldsText(elDesync, LONG) === 0);
 }
 
 console.log(`\nALL v0.9.15 DESYNC/ACK TESTS PASSED ✔ (${passed})`);

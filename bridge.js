@@ -487,21 +487,38 @@ if (!CFG) {
   // and only SUBMIT is failing; 0 with a full-looking DOM ⇒ desync, and the
   // correct remedy is the chunked caret retype (which routes through the
   // site's own beforeinput pipeline), NOT more blind Enter presses.
+  // v0.9.16 MEASUREMENT FIX (user log 2026-10-17 03:00): the exact-match scan
+  // returned stateFibers:0 on DeepSeek even though the site had ACTUALLY
+  // accepted our text — the retype fired at 03:00:35 and generation began at
+  // 03:00:50. The model stores the composer string with escapes/trailing
+  // whitespace differences (or appends its own scaffolding), so `norm(v) ===
+  // want` missed every real hit and forced a pointless 6-second re-injection.
+  // A containment test (model string contains our full text, or vice versa for
+  // sites that wrap it) catches those representations; the strict-equality
+  // count is kept as a separate signal for the desync verdict below.
   function reactHoldsText(el, text) {
     const want = norm(text);
     if (!want) return -1;                              // nothing to match against
-    let hits = 0;
+    let hits = 0, looseHits = 0;
+    const test = (v) => {                              // returns 'exact' | 'contains' | null
+      if (typeof v !== "string") return null;
+      const n = norm(v);
+      if (!n) return null;
+      if (n === want) return "exact";
+      if (want.length >= 40 && (n.includes(want) || (n.length >= 40 && want.includes(n)))) return "contains";
+      return null;
+    };
     try {
       for (const k of Object.keys(el)) {
         if (!k.startsWith("__reactFiber$")) continue;
         let node = el[k], hops = 0;
         while (node && hops++ < 30) {
-          let matched = false;
+          let matched = null;
           for (const p of [node.memoizedProps, node.pendingProps]) {
             if (!p || typeof p !== "object") continue;
             for (const key of ["value", "text", "message", "inputValue", "draft"]) {
-              const v = p[key];
-              if (typeof v === "string" && norm(v) === want) { matched = true; break; }
+              const r = test(p[key]);
+              if (r) { matched = r; break; }
             }
             if (matched) break;
           }
@@ -509,23 +526,25 @@ if (!CFG) {
             let hook = node.memoizedState, hl = 0;     // useState/useReducer chain
             while (hook && hl++ < 24) {
               const s = hook.memoizedState;
-              if (typeof s === "string" && norm(s) === want) { matched = true; break; }
+              const r = test(s);
+              if (r) { matched = r; break; }
               if (s && typeof s === "object") {
                 for (const v of Object.values(s)) {
-                  if (typeof v === "string" && norm(v) === want) { matched = true; break; }
+                  const r2 = test(v);
+                  if (r2) { matched = r2; break; }
                 }
               }
               if (matched) break;
               hook = hook.next;
             }
           }
-          if (matched) hits++;
+          if (matched) { hits++; if (matched === "contains") looseHits++; }
           node = node.return;
         }
         break;                                          // one fiber root is enough
       }
     } catch {}
-    return hits;
+    return hits > 0 ? { hits, looseHits } : 0;         // 0 ⇒ provably not in any ancestor model
   }
 
   // ── v0.9.11: direct React handler invocation ──────────────────────────────
@@ -696,6 +715,7 @@ if (!CFG) {
     // Previously we could fire Enter while React hadn't registered the value
     // yet ("reply entered but not submitted"), or accept a phantom submit.
     let submitted = false;
+    let skipBoxEmptyVerdict = false;                   // v0.9.16: retype-accepted ⇒ box stays full by design
     for (let attempt = 1; attempt <= 3 && !submitted; attempt++) {
       el.scrollIntoView({ block: "center" });
       el.focus({ preventScroll: true });
@@ -876,11 +896,21 @@ if (!CFG) {
     // an app whose model was still EMPTY. If the fiber-state scan finds NO
     // ancestor holding our text while the box looks full, force ONE bounded
     // chunked-retype pass (the only injection route real chat editors accept).
+    // v0.9.16 DO-NOT-UNDO INVARIANT (user log 2026-10-17 03:00): the retype is
+    // destructive — it clears the DOM and re-inserts char-by-char. It must
+    // NEVER run when the site's own model already holds our text; that case
+    // (stateFibers > 0 / "react state ok") means only SUBMIT failed, and a
+    // retype there just burns ~6 s and risks corrupting a live composer. The
+    // verdict below therefore stays conservative: retype ONLY on a proven-zero
+    // fiber scan against a non-empty box.
     const holds = reactHoldsText(el, text);
-    const stateDesynced = holds === 0 && !!readBox(el).trim();
+    const holdCount = typeof holds === "object" ? holds.hits : holds;
+    const looseCount = typeof holds === "object" ? holds.looseHits : 0;
+    const stateDesynced = holdCount === 0 && !!readBox(el).trim();
     if (!submitted && readBox(el).trim() && (!alreadyTyped || stateDesynced)) {
       lbLog("WARN", "button/submit/Enter all failed — chunked caret retype",
-            { remaining: readBox(el).trim().slice(0, 40), stateFibers: holds, wasAlreadyTyped: alreadyTyped });
+            { remaining: readBox(el).trim().slice(0, 40), stateFibers: holdCount,
+              exactFibers: holdCount - looseCount, wasAlreadyTyped: alreadyTyped });
       await activateSelf("retype");                   // needs real focus most of all
       try {
         setNativeValue(el, "");                       // ONE clean clear
@@ -899,7 +929,24 @@ if (!CFG) {
           }
           await sleep(isCE(el) ? 30 : 15);
         }
+        // v0.9.16 RETYPE-POST ACCEPTANCE PROBE (user log 2026-10-17 03:00):
+        // DeepSeek's first round ran exactly like this — the retype finished,
+        // every waitBoxEmptied() said no, and only at 03:00:50 did we realize
+        // the site HAD accepted the message all along (bubble grew; later a
+        // full 5707-char reply). The box-empty test alone cannot distinguish
+        // "model rejected my text" from "model holds it but Enter is inert".
+        // Probe the fiber model right after insertion: if our text landed in
+        // the app's state, stop hammering Enter variants (~6 s wasted per pass)
+        // and hand off to the direct-handler/final-resort channels immediately.
         await sleep(250);
+        const postRetypeHolds = reactHoldsText(el, text);
+        const postRetypeCount = typeof postRetypeHolds === "object" ? postRetypeHolds.hits : postRetypeHolds;
+        if (postRetypeCount > 0 && readBox(el).trim()) {
+          lbLog("INFO", "retype accepted by site model — skipping further Enter variants, deferring to direct-handler submit",
+                { stateFibers: postRetypeCount });
+          submitted = false;                           // final-resort block below owns the submit now
+          skipBoxEmptyVerdict = true;                  // box is SUPPOSED to stay full here — don't re-derive a verdict from it
+        } else {
         // v0.9.10: same modifier-aware send as channel #3/#4 — the retype
         // fallback used to press bare Enter only, which a Ctrl+Enter site
         // treats as a newline (leaving the whole text in the box).
@@ -916,7 +963,8 @@ if (!CFG) {
             if (b2) { dispatchClick(b2); await waitBoxEmptied(el, 1500); }
           }
         }
-        submitted = !readBox(el).trim();
+        }
+        if (!skipBoxEmptyVerdict) submitted = !readBox(el).trim();
       } catch (e) { lbLog("ERROR", "retype fallback threw", { err: String(e).slice(0, 120) }); }
     }
     // v0.9.4: ghost-send check — before declaring failure, give the site one
@@ -1436,7 +1484,8 @@ if (!CFG) {
           await sleep(150);                            // let React commit the empty state
           const holdsAfter = reactHoldsText(el, lastSentText || "\u0000");
           lbLog("INFO", "reset_composer: composer model reset before retry",
-                { domChars: readBox(el).trim().length, stateHoldsLastSent: holdsAfter });
+                { domChars: readBox(el).trim().length,
+                  stateHoldsLastSent: typeof holdsAfter === "object" ? holdsAfter.hits : holdsAfter });
         } catch (e) { lbLog("WARN", "reset_composer failed", { err: String(e).slice(0, 100) }); }
       })();
       return;

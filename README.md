@@ -21,6 +21,23 @@
 ---
 
 
+## v0.9.18 — The monitor page grew up
+
+- **Live conversation, in full.** Every prompt and reply now streams to the
+  monitor as complete markdown bubbles (code blocks, lists, bold) — nothing is
+  truncated to a 200-char preview anymore. Short replies are auto-upgraded to
+  the site's own rendered HTML (sanitized), so Qwen/DeepSeek formatting shows
+  exactly as on the chat page.
+- **Start/Stop from the monitor works** in zero-terminal *engine* mode: ▶ arms
+  and starts the in-browser swarm through the extension itself instead of only
+  talking to the legacy Python orchestrator over WebSocket.
+- **RUN statistics are truthful.** Turns-captured / last-hop / started counters
+  are derived from the engine's authoritative feed ring, not from lagging state
+  broadcasts that never updated mid-run.
+- Self-healing capture (v0.9.17): "I prefer this response"-style UI chrome is
+  filtered out of reply scanning; a broken-record guard caps identical failed
+  submissions so an impass terminates with one honest error instead of a loop.
+
 ## v0.6 — Start when YOU say start
 
 - **No more auto-fire.** Launching `orchestrator.py` only *arms* the swarm: it
@@ -200,6 +217,21 @@ git tag v0.3.0 && git push origin v0.3.0    # → Release with downloadable zip 
 ```
 
 ---
+
+## 🩺 Troubleshooting & self-healing design
+
+Shoarma assumes the worst of hostile web UIs and degrades gracefully:
+
+| Symptom | What the code does |
+|---|---|
+| React composer ignores injected text | fiber probe (`reactHoldsText`) detects DOM/model desync → one bounded caret retype through the site's own input pipeline, then direct handler invocation |
+| Site shows a feedback gate ("Good Response", "I prefer this response") | confirm-gate auto-click; the same strings are blacklisted from reply capture so UI chrome can never poison the thread |
+| Nothing capturable after a send | one bounded capture retry per hop, then an honest `NO RESPONSE CAPTURED` diagnostic (bubble classes included) — never a placeholder relayed as an argument |
+| Same message fails repeatedly | broken-record guard: max 2 attempts per identical prompt, then the run terminates cleanly instead of looping forever |
+| Monitor shows no data | engine mirrors its log ring + full-text feed into `chrome.storage.local`; the monitor drains both every 800 ms and dedupes by sequence |
+
+Every failure path emits structured debug lines; **📋 Copy debug** on the
+monitor gathers the whole story for a bug report.
 
 ## 🔧 Troubleshooting
 

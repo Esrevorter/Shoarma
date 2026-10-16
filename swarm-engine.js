@@ -25,7 +25,23 @@ const ENGINE = {
   transcript: [],           // {role, agent, text, ts, captured}
   timers: {},               // named setTimeout ids we can cancel
   lastRunEndedAt: 0,        // v0.9.14: Date.now() stamp set by finishRun(); guards onRegister
+  feedSeq: 0,               // v0.9.18: monotonic seq for the monitor conversation feed
 };
+
+// v0.9.18 CONVERSATION FEED: mirrors every prompt/reply/error as a FULL-TEXT
+// event into local.feedEvents (ring of 200). Before this, the monitor could
+// only show debug log lines whose payloads were preview-clipped to ~60-80
+// chars — users saw conversations "cut off at 200 characters". The engine is
+// the single source of truth for what was said; the monitor renders it here.
+function pushFeed(ev) {
+  ENGINE.feedSeq += 1;
+  const entry = Object.assign({ seq: ENGINE.feedSeq, ts: Date.now() }, ev);
+  chrome.storage.local.get({ feedEvents: [] }, ({ feedEvents }) => {
+    if (!Array.isArray(feedEvents)) feedEvents = [];
+    const ring = feedEvents.concat([entry]);
+    chrome.storage.local.set({ feedEvents: ring.length > 200 ? ring.slice(-200) : ring });
+  });
+}
 
 const TOPIC_FALLBACK =
   "Two AI assistants take turns building on each other's ideas. " +
@@ -176,6 +192,7 @@ function arm(topic, turns, timeout) {
   ENGINE.turns = Math.min(Math.max(Number(turns) || 6, 1), 50);
   ENGINE.timeout = Math.min(Math.max(Number(timeout) || 180, 15), 600);
   ENGINE.transcript = [];
+  chrome.storage.local.set({ feedEvents: [] });        // v0.9.18: fresh run → fresh conversation feed
   ENGINE.turnCount = 0;
   ENGINE.retryCount = 0;                              // v0.9.17: per-run broken-record budget (one re-dispatch max)
   ENGINE.startedAt = Date.now();
@@ -215,6 +232,7 @@ function sendPromptToCurrent(text) {
   if (!to || !ENGINE.agents.has(to)) { finishRun("target agent vanished"); return; }
   ENGINE.lastText = text;
   ENGINE.retryCount = 0;                              // v0.9.17: fresh prompt gets a fresh one-retry budget
+  pushFeed({ type: "prompt", agent: to, turn: ENGINE.turnCount + 1, text: String(text || "") });
   deliver(to, { type: "say", text });
   armReplyTimeout();
 }
@@ -447,7 +465,7 @@ function onRegister(msg, senderTabId) {
   }
 }
 
-function onReply(msg, fromName) {
+function onReply(msg, fromName, fromTabId) {
   settleAttempt(true);                                // v0.9.2: resolve cool-down retry
   const from = ENGINE.agents.get(fromName);
   if (from) releaseAgent(fromName);
@@ -478,6 +496,8 @@ function onReply(msg, fromName) {
   // path below; no separate adoptLateReply pass is needed for this frame.
   if (!isReplyFrame && captured) {
     ENGINE.transcript.push({ role: "assistant", agent: fromName, text, ts: Date.now(), captured });
+    pushFeed({ type: "reply", agent: fromName, turn: ENGINE.turnCount + 1, text, tabId: fromTabId ?? null });
+    persistTranscript();                               // v0.9.18: keep lastTranscript current mid-run
     // v0.9.4 (test-verified): count the adopted turn HERE so the HUD's turn
     // pill and the engine-state frame are truthful immediately. adoptLateReply
     // performs the handoff but must not double-count.
@@ -538,6 +558,9 @@ function onReply(msg, fromName) {
   }
   ENGINE.transcript.push({ role: captured ? "assistant" : "error", agent: fromName,
                            text, ts: Date.now(), captured });
+  if (captured) pushFeed({ type: "reply", agent: fromName, turn: ENGINE.turnCount, text, tabId: fromTabId ?? null });
+  else pushFeed({ type: "error", agent: fromName, turn: ENGINE.turnCount, text: `capture failed (${text.slice(0, 120)})`, tabId: fromTabId ?? null });
+  persistTranscript();                                 // v0.9.18: keep lastTranscript current mid-run
   if (ENGINE.turnCount >= ENGINE.turns * 2) { finishRun("turn-budget"); return; }
   // hand the reply to the partner agent (strict alternation)
   const next = ENGINE.partnerOf[fromName] || [...ENGINE.agents.keys()].find(n => n !== fromName);
@@ -649,7 +672,7 @@ async function handleEngineMessage(msg, sender, respond) {
   switch (msg?.type) {
     case "register":       onRegister(msg, tabId); respond({ ok: true }); return false;
     case "ready":          if (fromName) releaseAgent(fromName); respond({ ok: true }); return false;
-    case "reply":          onReply(msg, fromName); respond({ ok: true }); return false;
+    case "reply":          onReply(msg, fromName, msg.tabId ?? sender?.tab?.id); respond({ ok: true }); return false;
     case "send_failed":    onSendFailure(msg, fromName); respond({ ok: true }); return false;
     // v0.9.2: bridge throws this when say() fails for ANY reason (input not
     // found, injection rejected, send channels exhausted). Without it the
@@ -665,7 +688,7 @@ async function handleEngineMessage(msg, sender, respond) {
         // off to the partner synchronously. Calling handleFailedTurn here too
         // raced a second adoption path against it — double turn counts and
         // duplicate handoffs. onReply alone is the correct single owner.
-        onReply(msg, fromName);
+        onReply(msg, fromName, tabId);
       } else if (ENGINE.state === "running") {
         onSendFailure({ preview: String(msg.text || "").slice(0, 80) }, fromName);
       }

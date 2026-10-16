@@ -84,7 +84,8 @@ if (!CFG) {
   // Defensive: content script injected on a host we don't know how to drive.
   console.warn("LLM Bridge: no site config for", location.hostname);
 } else {
-  const state = { halted: false, ws: null, turns: 0, lastMs: 0, lastState: "connecting" };
+  const state = { halted: false, ws: null, turns: 0, lastMs: 0, lastState: "connecting",
+                    chat: null };                                   // v0.9.18: full last exchange {prompt, reply, ts} for the monitor
   let busy = false;                                   // v0.8.3: single-flight turn guard
   let pendingSay = null;                              // v0.8.3: newest say queued while busy
   let pendingSayAckQueued = false;                    // v0.9.15: say accepted → ACK queued:true (see handleOrchestratorFrame)
@@ -1406,6 +1407,7 @@ if (!CFG) {
   async function runTurn(text) {
     const t0 = performance.now();
     lbLog("INFO", `turn #${state.turns + 1}: received prompt`, { chars: String(text).length, preview: String(text).slice(0, 80) });
+    state.chat = { prompt: String(text || ""), reply: null, ts: Date.now() };   // v0.9.18: full text, no clip
     hud("writing…");
     let textToSay = String(text);
     let textP = "(no response captured)";
@@ -1445,10 +1447,11 @@ if (!CFG) {
         pendingSay = null;
       }
       state.turns++;
+      if (state.chat) state.chat.reply = String(textP || "");       // v0.9.18: full reply for the monitor
       state.lastMs = performance.now() - t0;
       lbLog("INFO", `turn #${state.turns} complete`, { seconds: +(state.lastMs / 1000).toFixed(1), replyChars: textP.length });
       hud("idle");
-      transport?.send({ type: "reply", agent: CFG.name, text: textP });
+      transport?.send({ type: "reply", agent: CFG.name, text: textP });   // v0.9.18: tabId stamped engine-side from sender.tab (content scripts have no chrome.tabs)
     } catch (e) {
       lbLog("ERROR", "turn FAILED", { error: String(e), stack: String(e.stack).split("\n").slice(0, 3).join(" | ") });
       hud("error");
@@ -1457,6 +1460,7 @@ if (!CFG) {
       // the swarm engine ADOPTS the turn instead of treating it as a failure
       // and re-injecting into a live composer (user log 19:33→19:36 spiral).
       const lateReply = textP && textP !== "(no response captured)" ? textP : null;
+      if (lateReply && state.chat) state.chat.reply = String(lateReply);  // v0.9.18
       try { transport?.send({ type: "error", agent: CFG.name, text: lateReply || String(e), ...(lateReply ? { captured: true } : {}) }); } catch {}
     } finally {
       busy = false;
@@ -1605,6 +1609,14 @@ if (!CFG) {
   try {
     chrome.runtime.onMessage.addListener((m, _s, respond) => {
       if (!m) return;
+      if (m?.type === "capture-html") {                // v0.9.18: monitor asks for the real rendered bubble
+        try {
+          const nodes = assistantNodes();
+          const last = nodes[nodes.length - 1];
+          respond({ ok: true, html: last ? last.innerHTML : "", text: last ? String(last.innerText || "").trim() : "" });
+        } catch (e) { respond({ ok: false, error: String(e).slice(0, 120) }); }
+        return true;
+      }
       if (["say", "swarm", "clear_input", "registered", "resume", "engine-log", "reset_composer"].includes(m.type)) {
         pendingSayAckQueued = false;                   // v0.9.15: fresh dispatch — clear last ACK flag
         handleOrchestratorFrame(m);
@@ -1629,6 +1641,9 @@ if (!CFG) {
         agent: CFG.name, state: state.lastState, turns: state.turns,
         wsOpen: transport?.alive() ?? false, halted: state.halted, transport: transport?.mode || "none",
         log: LB_LOG.slice(),                                 // v0.9.9: monitor reads engine lines from here
+        chat: state.chat ? { prompt: state.chat.prompt, reply: state.chat.reply, ts: state.chat.ts } : null,
+        // v0.9.18: full last exchange (unclipped) — the monitor renders real
+        // markdown bubbles from this when the engine feed lacks a tabId.
       });
       else if (m?.type === "halt") toggleHalt(!!m.halted);
       return true;

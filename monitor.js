@@ -84,15 +84,37 @@ function ctlConnect() {
   });
 }
 ctlConnect();
-document.addEventListener("click", (e) => {
-  if (e.target.id === "ctl-start") {
-    chrome.storage.sync.get({ topic: "", turns: 6 }, (cfg) => {
-      if (ctlWs?.readyState === 1) ctlWs.send(JSON.stringify({ type: "start", topic: cfg.topic, turns: cfg.turns }));
-      e.target.disabled = true; e.target.textContent = "▶ starting…";
-      setTimeout(() => { e.target.disabled = false; e.target.textContent = "▶ Start swarm"; }, 3000);
-    });
+// v0.9.18 BUGFIX ("swarm can't be started from the monitor page — it stops
+// again"): the old handler ONLY spoke to the remote Python orchestrator over
+// WS. In engine mode ctlWs is never OPEN → clicking Start sent nothing, and
+// the poller re-hid the button on the next tick ("stops again"). Now Start
+// arms AND starts the in-browser engine through runtime messaging (exactly
+// like the popup does), falling back to the WS path only in remote mode.
+async function sendStart() {
+  const cfg = await chrome.storage.sync.get({ topic: "", turns: 6, timeout: 180, bridgeMode: "engine" });
+  const topic = String(cfg.topic || "").trim();
+  const turns = Math.min(Math.max(Number(cfg.turns) || 6, 1), 50);
+  if (cfg.bridgeMode !== "remote") {
+    try { await chrome.runtime.sendMessage({ type: "arm", topic, turns, timeout: Number(cfg.timeout) || 180 }); } catch {}
+    try { await chrome.runtime.sendMessage({ type: "start", topic, turns }); } catch {}
+    return true;
   }
-  if (e.target.id === "ctl-stop" && ctlWs?.readyState === 1) ctlWs.send(JSON.stringify({ type: "stop" }));
+  if (ctlWs?.readyState === 1) { ctlWs.send(JSON.stringify({ type: "start", topic, turns })); return true; }
+  return false;
+}
+document.addEventListener("click", async (e) => {
+  if (e.target.id === "ctl-start") {
+    const b = e.target;
+    b.disabled = true; b.textContent = "▶ starting…";
+    const ok = await sendStart();
+    if (!ok) renderEvent({ type: "log", agent: "monitor", level: "WARN", seq: 0, msg: "start failed — no live engine/orchestrator connection" });
+    setTimeout(() => { b.disabled = false; b.textContent = "▶ Start swarm"; }, 1500);
+  }
+  if (e.target.id === "ctl-stop") {
+    const cfg = await chrome.storage.sync.get({ bridgeMode: "engine" });
+    if (cfg.bridgeMode !== "remote") { try { await chrome.runtime.sendMessage({ type: "stop" }); } catch {} }
+    else if (ctlWs?.readyState === 1) ctlWs.send(JSON.stringify({ type: "stop" }));
+  }
 });
 
 chrome.storage.sync.get({ halted: false }, (cfg) => {
@@ -143,6 +165,115 @@ async function drainEngineRing() {
                   data: e.data, ts: new Date(e.ts || Date.now()).toLocaleTimeString(), seq: 0 });
   }
 }
+// v0.9.18 CONVERSATION RENDERING: the engine mirrors every full-text prompt/
+// reply into local.feedEvents (see pushFeed in swarm-engine.js). Render those
+// as proper chat bubbles with markdown — previously the monitor only showed
+// clipped debug log previews (~60-200 chars), which is what users saw as
+// "conversation cut off at 200 characters". Replies whose text is missing or
+// truncated relative to the bridge's own state.chat are upgraded to the real
+// site-rendered HTML (markdown intact) via a DOM copy of the source bubble.
+let lastFeedSeq = 0;
+const chatByTab = new Map();               // tabId -> { ts, html } already-rendered real bubbles
+async function drainFeedEvents(agentsByName) {
+  const { feedEvents } = await chrome.storage.local.get({ feedEvents: [] });
+  if (!Array.isArray(feedEvents)) return;
+  for (const ev of feedEvents) {
+    if (!Number.isFinite(ev.seq) || ev.seq <= lastFeedSeq) continue;
+    lastFeedSeq = ev.seq;
+    if (ev.type === "prompt") {            // incoming prompts duplicate the previous reply — skip
+      renderChatLine({ agent: "you/engine", role: "prompt", text: ev.text, turn: ev.turn, ts: ev.ts, collapsed: true });
+      continue;
+    }
+    if (ev.type === "reply" || ev.type === "error") {
+      const needUpgrade = ev.type === "reply" && (!ev.text || String(ev.text).length < 400);
+      let rendered = false;
+      if (needUpgrade && Number.isInteger(ev.tabId)) {
+        const key = `${ev.tabId}|${ev.ts}`;
+        if (!chatByTab.has(key)) {
+          try {
+            const st = await chrome.tabs.sendMessage(ev.tabId, { type: "capture-html" });
+            if (st && typeof st.html === "string" && st.html.length > 50) chatByTab.set(key, { ts: ev.ts, html: st.html });
+          } catch {}
+        }
+        const cached = chatByTab.get(key);
+        if (cached) { renderChatLine({ agent: ev.agent, role: "reply", html: cached.html, turn: ev.turn, ts: ev.ts }); rendered = true; }
+      }
+      if (!rendered) renderChatLine({ agent: ev.agent, role: ev.type === "error" ? "error" : "reply", text: ev.text, turn: ev.turn, ts: ev.ts });
+    }
+  }
+}
+
+function esc(s) { return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+// Defense-in-depth for site-HTML upgrades: strip script/style/iframe/object/
+// svg nodes, on* attributes and javascript:/data: URLs before injection.
+function sanitizeSiteHtml(raw) {
+  try {
+    const doc = new DOMParser().parseFromString(String(raw || ""), "text/html");
+    doc.querySelectorAll("script,style,iframe,object,embed,link,meta,svg,form,input,button").forEach(n => n.remove());
+    doc.querySelectorAll("*").forEach(n => {
+      for (const a of [...n.attributes]) {
+        if (/^on/i.test(a.name)) n.removeAttribute(a.name);
+        else if ((a.name === "href" || a.name === "src") && /^\s*(javascript|data):/i.test(a.value)) n.removeAttribute(a.name);
+      }
+    });
+    return doc.body.innerHTML;
+  } catch { return esc(raw); }
+}
+
+// Minimal, XSS-safe markdown renderer (no external libs, CSP-friendly):
+// fenced code blocks, inline code, bold/italic, headings, lists, links-by-url.
+function mdToHtml(src) {
+  const lines = String(src || "").split("\n");
+  const out = []; let inCode = false; let codeBuf = [];
+  const inline = (t) => esc(t)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  for (const ln of lines) {
+    const fence = /^\s*```/.test(ln);
+    if (fence) {
+      if (inCode) { out.push(`<pre><code>${esc(codeBuf.join("\n"))}</code></pre>`); codeBuf = []; inCode = false; }
+      else inCode = true;
+      continue;
+    }
+    if (inCode) { codeBuf.push(ln); continue; }
+    const h = ln.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { out.push(`<h${h[1].length + 1 > 6 ? 6 : h[1].length}>${inline(h[2])}</h${h[1].length + 1 > 6 ? 6 : h[1].length}>`); continue; }
+    const li = ln.match(/^\s*(?:[-*•]|\d+[.)])\s+(.*)$/);
+    if (li) { out.push(`• ${inline(li[1])}<br>`); continue; }
+    if (/^\s*(?:---|\*\*\*)\s*$/.test(ln)) { out.push("<hr>"); continue; }
+    out.push(ln.trim() === "" ? "<br>" : inline(ln) + "<br>");
+  }
+  if (inCode && codeBuf.length) out.push(`<pre><code>${esc(codeBuf.join("\n"))}</code></pre>`);
+  return out.join("");
+}
+
+function renderChatLine({ agent, role, text, html, turn, ts, collapsed }) {
+  const feed = $("feed");
+  $("empty")?.remove();
+  const d = document.createElement("div");
+  d.className = `msg chat ${role} ${agent || ""}`;
+  if (collapsed) d.classList.add("collapsed");
+  const time = ts ? new Date(ts).toLocaleTimeString() : new Date().toLocaleTimeString();
+  const head = `<div class="meta"><span class="who ${String(agent || "").replace(/[^a-z0-9_-]/gi, "")}">${esc(agent)}</span><span>turn ${esc(turn ?? "\u2014")}</span><span>${esc(time)}</span></div>`;
+  const body = html
+    ? `<div class="txt md real">${sanitizeSiteHtml(html)}</div>`     // site-rendered HTML, scrubbed of scripts/handlers
+    : `<div class="txt md">${mdToHtml(text)}</div>`;
+  const fold = collapsed ? `<details><summary>↳ prompt (${String(text || "").length} chars)</summary>${body}</details>` : body;
+  d.innerHTML = head + fold;
+  feed.appendChild(d);
+  DEBUG_LINES.push(`${time} ${role.toUpperCase()} ${agent}: ${clip(String(text || "[real-site-html]"), 400)}`);
+  if (/REPLY|ERROR/.test(role.toUpperCase())) {
+    const t = $("stat-turns"); t.textContent = Number(t.textContent) + 1;
+    $("stat-last").textContent = time;
+    if ($("stat-started").textContent === "—") $("stat-started").textContent = time;
+  }
+  nearBottom(feed) && (feed.scrollTop = feed.scrollHeight);
+  trimDom();
+}
+
 async function pollEngine() {
   const { swarmState } = await chrome.storage.local.get({ swarmState: null });
   if (!swarmState) return false;           // engine never ran → remote discovery next
@@ -172,14 +303,28 @@ async function pollEngine() {
                   msg: `state → ${swarmState.state} · turn ${swarmState.turn ?? 0}/${swarmState.turns ?? "?"} · agents: ${(swarmState.agents || []).join(", ") || "none"}` });
   }
   if (Object.keys(agents).length) renderAgents(agents);
-  // progress from the engine's own counters
+  await drainFeedEvents(agents);
+  // v0.9.18 BUGFIX ("RUN statistics do not update"): stat-turns was driven by
+  // two competing sources — logLine()'s REPLY regex bump AND this overwrite
+  // from swarmState.turnCount. SwarmState broadcasts lag (the engine only
+  // calls broadcastState on phase changes, NOT after every reply), so the
+  // overwrite kept resetting the counter behind the real progress. The feed
+  // events ring IS the authoritative record now: count replies directly.
+  const { feedEvents } = await chrome.storage.local.get({ feedEvents: [] });
+  const replies = Array.isArray(feedEvents) ? feedEvents.filter(e => e.type === "reply") : [];
   const totalTurns = Math.max(1, Number(swarmState.turns) || 6) * 2;
-  $("stat-turns").textContent = Math.min(swarmState.turn || 0, totalTurns);
-  if ((swarmState.turn || 0) > 0 && $("stat-started").textContent === "—")
-    $("stat-started").textContent = new Date().toLocaleTimeString();
-  // start/stop buttons follow the engine phase
+  $("stat-turns").textContent = Math.min(replies.length, totalTurns);
+  if (replies.length > 0) {
+    const first = feedEvents.find(e => e.type === "prompt" || e.type === "reply");
+    if (first && $("stat-started").textContent === "—") $("stat-started").textContent = new Date(first.ts || Date.now()).toLocaleTimeString();
+    const last = replies[replies.length - 1];
+    if (last?.ts) $("stat-last").textContent = new Date(last.ts).toLocaleTimeString();
+  }
+  // v0.9.18: keep the Start button visible whenever the engine is NOT running
+  // (idle/armed/done) so the monitor can actually launch runs; previously it
+  // appeared only in "armed" for one poll and vanished again mid-idle.
   const b1 = document.getElementById("ctl-start"), b2 = document.getElementById("ctl-stop");
-  if (b1) b1.style.display = swarmState.state === "armed" ? "" : "none";
+  if (b1) { b1.style.display = swarmState.state !== "running" ? "" : "none"; b1.title = "Start the swarm with your saved popup Topic (arms + starts the in-browser engine)"; }
   if (b2) b2.style.display = swarmState.state === "running" ? "" : "none";
   return true;
 }
@@ -286,4 +431,12 @@ $("copy").onclick = async () => {
   $("copy").classList.add("ok-flash"); $("copy").textContent = "✓ copied — paste it to the agent";
   setTimeout(() => { $("copy").classList.remove("ok-flash"); $("copy").textContent = "📋 Copy debug"; }, 2500);
 };
-$("clear").onclick = () => { $("feed").innerHTML = ""; DEBUG_LINES = []; lastSeq = 0; };  // v0.9.12: was a no-op (lastSeq = lastSeq) — cleared feed then the poller skipped every event with seq < old lastSeq → monitor looked dead/empty
+$("clear").onclick = async () => { $("feed").innerHTML = ""; DEBUG_LINES = []; lastSeq = 0; lastFeedSeq = await ENGINE_FEED_HEAD(); chatByTab.clear(); };
+// After clearing we must NOT replay the whole stored ring; jump the cursor to
+// the newest seq so only genuinely new events render afterwards.
+async function ENGINE_FEED_HEAD() {
+  try {
+    const { feedEvents } = await chrome.storage.local.get({ feedEvents: [] });
+    return Array.isArray(feedEvents) && feedEvents.length ? feedEvents[feedEvents.length - 1].seq : 0;
+  } catch { return 0; }
+}  // v0.9.12: was a no-op (lastSeq = lastSeq) — cleared feed then the poller skipped every event with seq < old lastSeq → monitor looked dead/empty

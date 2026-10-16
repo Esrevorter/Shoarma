@@ -102,3 +102,17 @@ footer { padding: 10px 22px; border-top: 1px solid var(--line); font-size: 11.5p
 /* v0.6 */
 .btn.go { background: linear-gradient(135deg,#2dd4a7,#4cc9f0); color:#06231b; font-weight:800; }
 .btn.stop { background: rgba(255,92,122,.15); color:#ff8ba1; border-color:rgba(255,92,122,.4); }
+
+/* ── v0.9.18 conversation rendering: markdown chat bubbles ─────────────── */
+.msg.chat .txt.md { white-space: normal; }
+.msg.chat .txt.md h2, .msg.chat .txt.md h3, .msg.chat .txt.md h4 { margin: .6em 0 .3em; font-size: 1.05em; }
+.msg.chat .txt.md pre { background: rgba(0,0,0,.35); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: .5em 0; }
+.msg.chat .txt.md code { background: rgba(255,255,255,.12); border-radius: 4px; padding: 1px 5px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .92em; }
+.msg.chat .txt.md pre code { background: transparent; padding: 0; }
+.msg.chat .txt.md b { color: #fff; }
+.msg.chat .txt.md a { color: #7cc4ff; text-decoration: underline; }
+.msg.chat .txt.md hr { border: none; border-top: 1px solid rgba(255,255,255,.15); margin: .6em 0; }
+.msg.chat.reply .txt { border-left: 3px solid #5ad17a; padding-left: 10px; }
+.msg.chat.error .txt { border-left: 3px solid #e66; padding-left: 10px; color: #f2b8b8; }
+.msg.chat.collapsed { opacity: .85; }
+.msg.chat.collapsed summary { cursor: pointer; color: #9ab; font-size: .9em; }

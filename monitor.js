@@ -264,7 +264,9 @@ function renderChatLine({ agent, role, text, html, turn, ts, collapsed }) {
   const fold = collapsed ? `<details><summary>↳ prompt (${String(text || "").length} chars)</summary>${body}</details>` : body;
   d.innerHTML = head + fold;
   feed.appendChild(d);
-  DEBUG_LINES.push(`${time} ${role.toUpperCase()} ${agent}: ${clip(String(text || "[real-site-html]"), 400)}`);
+  // v0.9.19: through addDebugLine — chat lines can also arrive twice (feed
+  // event + replay after clear), and the dump must stay free of duplicates.
+  addDebugLine(`${time} ${role.toUpperCase()} ${agent}: ${clip(String(text || "[real-site-html]"), 400)}`);
   if (/REPLY|ERROR/.test(role.toUpperCase())) {
     const t = $("stat-turns"); t.textContent = Number(t.textContent) + 1;
     $("stat-last").textContent = time;
@@ -417,7 +419,22 @@ function trimDom() {
 }
 function nearBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 160; }
 function clip(s, n) { s = String(s ?? ""); return s.length > n ? s.slice(0, n) + "…" : s; }
-function logLine(l) { DEBUG_LINES.push(l); if (DEBUG_LINES.length > 1200) DEBUG_LINES.splice(0, 200); 
+// v0.9.19 LOG HYGIENE (polluter B): the copy-debug dump contained every
+// engine line TWICE — once from drainEngineRing() (ts "13:36:41") and once
+// re-ingested from bridge `status` mirrors (wall-clock "3:36:41 PM"). The two
+// timestamp formats in the user dump were that double ingestion. addDebugLine
+// dedupes by content with the leading timestamp stripped, so the same message
+// arriving through both paths lands in DEBUG_LINES exactly once.
+function addDebugLine(l) {
+  const key = String(l).replace(/^\S+\s/, "");   // strip leading timestamp token
+  for (let i = DEBUG_LINES.length - 1; i >= 0 && i >= DEBUG_LINES.length - 250; i--) {
+    if (String(DEBUG_LINES[i]).replace(/^\S+\s/, "") === key) return false;
+  }
+  DEBUG_LINES.push(l);
+  if (DEBUG_LINES.length > 1200) DEBUG_LINES.splice(0, 200);
+  return true;
+}
+function logLine(l) { if (!addDebugLine(l)) return;
   const t = $("stat-turns"); if (/REPLY/.test(l)) t.textContent = Number(t.textContent) + 1;
   const m = l.match(/(\d\d:\d\d:\d\d)/); if (m && $("stat-started").textContent === "—") $("stat-started").textContent = m[1];
   if (/REPLY/.test(l)) $("stat-last").textContent = m ? m[1] : "now";

@@ -333,3 +333,16 @@ shoarma-v0.9.7-chrome.zip (13 entries, sha256=a2b07e084dcd0352bc822051387ddd0442
   .then/.catch chains onto chrome.* calls anywhere in swarm-engine.js, deliver() uses asPromise.
 - Node simulation with chrome.tabs.sendMessage -> undefined: boots clean, deliver('say') OK.
 - Bumped manifest to 0.9.8, gitignored + untracked error.log. Releasing via tag push + CI.
+
+## Session 2026-10-23 (handoff continuation) — state re-verified LIVE from GitHub; nothing new to ship
+New PAT supplied by the user via env (`GITHUB_TOKEN`, stored only in gitignored `/workspace/.env`, mode 600, never in tracked files or history). Token auth verified against the API (HTTP 200, identity `Esrevorter`). Remote re-added (sandbox repo is recreated each session without one): `origin = https://github.com/Esrevorter/Shoarma.git`.
+
+Full read-back of reality (per RULES.md §1 — prior turns' summaries are claims, not facts):
+- Local HEAD `439b0c6` == `origin/main` == tag `v0.9.18`. Working tree clean; **zero unpushed commits** (`git log origin/main..HEAD` empty). The v0.9.18 monitor overhaul was already published in the previous session — there was no unfinished local work to carry over.
+- Releases live: v0.9.17 and v0.9.18 (latest), each with its chrome zip asset attached by Actions. All pre-v0.9.5 releases remain deleted per the earlier cleanup.
+- PRs #1–#4: all CLOSED, none merged (history flows directly on `main`; each release was cut from main). No open PR exists; none is required because main already carries every released commit.
+- Full verification suite re-run green this session: `node --check` ×10 JS files, `py_compile` on all Python, manifest+launcher JSON valid, `tools/build_release.py` builds the v0.9.18 zip (13 entries incl. swarm-engine.js), and ALL test suites PASS: test-v094-recovery, test-d7-post-run-rearm, test-v0915-desync (17), test-v0917-chrome-words, test-v0918-monitor, tests/test_promise_safe_guards.py, tests/test_zapper_compliance.py.
+
+Where we left off / next actionable step (unchanged, honest status):
+- **Live end-to-end validation in Chrome remains pending on the user's machine.** Load the v0.9.18 zip (unzip → chrome://extensions → Developer mode → Load unpacked), keep both chat tabs visible, and watch for the v0.9.16–v0.9.18 fix signatures in the log: exact-match desync gate, chrome-word filtering, "GHOST SEND detected", "late reply ... adopting". If a run still fails, export 📋 copy-debug from the monitor page and hand it to the next session — that dump is the input the selector fixes need (see tools/PROBE.md).
+- Safety rules reaffirmed: no secrets in history, no force-push of `main`, feature branches only, report missing prerequisites truthfully.

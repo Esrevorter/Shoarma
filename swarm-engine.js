@@ -26,8 +26,31 @@ const ENGINE = {
   timers: {},               // named setTimeout ids we can cancel
   lastRunEndedAt: 0,        // v0.9.14: Date.now() stamp set by finishRun(); guards onRegister
   feedSeq: 0,               // v0.9.18: monotonic seq for the monitor conversation feed
+  lastRegister: {},         // v0.9.19: name -> { tabId, ts } — dedupe of bridge register frames
 };
 
+// v0.9.19 LOG HYGIENE (user debug.logs 2026-10-23, "poep in de machine"):
+// the dump was ~370 of 413 lines of identical ERRORs and every real signal
+// drowned. Three distinct polluters, fixed across swarm-engine.js / monitor.js:
+//   A) "Could not establish connection. Receiving end does not exist." —
+//      the bridge's lbLog() fire-and-forgets a `type:"log"` frame to the
+//      worker on EVERY log line. background.js answers it only while loaded,
+//      but since v0.9.5 swarm-engine.js IS the service worker and had no
+//      `log` case — so each frame rejected and the unhandledrejection shield
+//      logged an ERROR. Fix: router case "log" mirrors the line into the
+//      debug ring and ACKs synchronously; the shield also coalesces repeats
+//      into one counted line instead of logging N identical ERRORs.
+//   B) Duplicated feed: bridges mirror engine lines into their LB_LOG and
+//      answer `status` with them; the monitor re-ingested those copies next
+//      to the drainEngineRing originals — the two timestamp formats in the
+//      dump ("3:36:41 PM" vs "13:36:41") are that double ingestion. Fix:
+//      monitor.js logLine()/renderChatLine() go through addDebugLine(),
+//      which dedupes by content (timestamp stripped).
+//   C) Chatter: redundant INFO/WARN lines per turn — mid-turn queueing is
+//      normal single-flight behaviour (now DEBUG), "skipping cool-down"
+//      fires on every healthy late-reply adoption (now DEBUG), and
+//      persistTranscript logged an INFO line per hop (now DEBUG). Register
+//      frames from the same tab are deduped via ENGINE.lastRegister.
 // v0.9.18 CONVERSATION FEED: mirrors every prompt/reply/error as a FULL-TEXT
 // event into local.feedEvents (ring of 200). Before this, the monitor could
 // only show debug log lines whose payloads were preview-clipped to ~60-80
@@ -67,10 +90,23 @@ function asPromise(v) {
 function safeCatch(p, onError) {
   try { if (p && typeof p.catch === "function") p.catch(onError || (() => {})); } catch {}
 }
+let _lastRejectionKey = "", _lastRejectionCount = 0;
 self.addEventListener("unhandledrejection", (e) => {
   // Last-resort shield: log it into the debug ring instead of letting an
   // unhandled rejection tear down the service worker mid-run.
-  try { engLog("ERROR", "unhandled rejection (worker kept alive)", { reason: String(e?.reason).slice(0, 200) }); } catch {}
+  // v0.9.19 LOG HYGIENE: coalesce repeats. The user dump had ~370 identical
+  // ERROR lines ("Could not establish connection. Receiving end does not
+  // exist.") — one per unanswered bridge frame — drowning every real signal.
+  // The root cause is fixed at the router (case "log" now ACKs), but any
+  // residual fire-and-forget reject must never spam the ring either: a run of
+  // identical reasons logs ONE line, and each further repeat only bumps a
+  // counter that rides along on the next distinct occurrence.
+  const key = String(e?.reason).slice(0, 200);
+  if (key && key === _lastRejectionKey) { _lastRejectionCount++; e?.preventDefault?.(); return; }
+  const data = _lastRejectionCount ? { reason: _lastRejectionKey, repeats_ignored: _lastRejectionCount }
+                                   : { reason: key };
+  try { engLog("ERROR", "unhandled rejection (worker kept alive)", data); } catch {}
+  _lastRejectionKey = key; _lastRejectionCount = 0;
   e?.preventDefault?.();
 });
 
@@ -168,7 +204,10 @@ function deliver(name, frame) {
   }
   if (a.busy) {
     a.queue = [frame];         // newest-only, exactly like v0.8.3 pendingSay
-    engLog("WARN", `agent ${name} mid-turn — queued newest say behind it`,
+    // v0.9.19: DEBUG, not WARN — queueing behind an in-flight turn is the
+    // NORMAL single-flight behaviour and fired on almost every healthy turn;
+    // as WARN it polluted the dump (polluter C).
+    engLog("DEBUG", `agent ${name} mid-turn — queued newest say behind it`,
            { preview: String(frame.text).slice(0, 40) });
   } else {
     a.busy = true;
@@ -301,7 +340,10 @@ async function handleFailedTurn(fromName) {
       // branch below always arms its own timer before awaiting, so it can
       // never be misread as foreign.
       if (ENGINE.timers.reply) {
-        engLog("INFO", "turn already re-dispatched by a late reply — skipping cool-down");
+        // v0.9.19: DEBUG — this is the HEALTHY path (a late reply was adopted
+        // and handed off before the cool-down); it fired on every successful
+        // adoption and read like a warning in the dump (polluter C).
+        engLog("DEBUG", "turn already re-dispatched by a late reply — skipping cool-down");
         return;
       }
       await coolDown(wait);
@@ -448,7 +490,18 @@ function onRegister(msg, senderTabId) {
   const name = String(msg.agent || "").toLowerCase();
   if (!name) return;
   const prev = ENGINE.agents.get(name);
+  // v0.9.19 LOG HYGIENE: dedupe register frames. Bridges re-register on every
+  // reconnect/reload; each one used to emit an INFO "agent registered" line
+  // (chatter polluter C). A re-register from the SAME tab while the agent is
+  // already registered and idle-quiet (< 2 s) is a duplicate frame — update
+  // the bookkeeping silently, skip the log line and the auto-arm evaluation.
+  // Re-registers from a DIFFERENT tab (tab replaced) or after >2 s are real
+  // events and still log + evaluate auto-arm exactly as before.
+  const lr = ENGINE.lastRegister[name];
+  const dupRegister = prev && lr && lr.tabId === senderTabId && Date.now() - lr.ts < 2000;
+  ENGINE.lastRegister[name] = { tabId: senderTabId, ts: Date.now() };
   ENGINE.agents.set(name, { tabId: senderTabId, ready: true, busy: !!prev?.busy, queue: [] });
+  if (dupRegister) { try { chrome.tabs.sendMessage(senderTabId, { type: "registered", agent: name }); } catch {} return; }
   engLog("INFO", `agent registered: ${name}`, { tabId: senderTabId });
   try { chrome.tabs.sendMessage(senderTabId, { type: "registered", agent: name }); } catch {}
   if (ENGINE.state === "idle" && ENGINE.agents.size >= 2) {
@@ -623,7 +676,10 @@ function persistTranscript() {
   const rec = { version: chrome.runtime.getManifest().version, topic: ENGINE.topic,
                 startedAt: ENGINE.startedAt, savedAt: Date.now(), entries: ENGINE.transcript };
   chrome.storage.local.set({ [`transcript-${stamp}`]: rec, lastTranscript: rec });
-  engLog("INFO", "transcript saved to extension storage", { key: `transcript-${stamp}` });
+  // v0.9.19: DEBUG — persistTranscript() runs on every hop/handoff; as INFO it
+  // was one guaranteed chatter line per turn (polluter C). The storage key is
+  // still visible in the ring for anyone filtering at DEBUG level.
+  engLog("DEBUG", "transcript saved to extension storage", { key: `transcript-${stamp}` });
 }
 
 function downloadLastTranscript() {
@@ -671,6 +727,19 @@ async function handleEngineMessage(msg, sender, respond) {
   const fromName = String(msg?.agent || "").toLowerCase();
   switch (msg?.type) {
     case "register":       onRegister(msg, tabId); respond({ ok: true }); return false;
+    // v0.9.19 LOG HYGIENE (root fix for polluter A): bridge lbLog() sends a
+    // `type:"log"` frame to the worker on EVERY debug line. background.js used
+    // to answer these, but it is no longer the service worker (v0.9.5+), so in
+    // engine mode each frame went unanswered → the sendMessage promise rejected
+    // ("Receiving end does not exist") and the shield logged ~370 ERROR lines
+    // per run. Mirror the entry into our own ring (agent-tagged, so bridges
+    // that echo engine-log mirrors are naturally deduped by their own filters)
+    // and ACK synchronously so the caller's promise resolves.
+    case "log": {
+      const e = msg.entry || {};
+      engLog(e.level || "INFO", String(e.msg || ""), e.data !== undefined ? e.data : undefined);
+      respond({ ok: true }); return false;
+    }
     case "ready":          if (fromName) releaseAgent(fromName); respond({ ok: true }); return false;
     case "reply":          onReply(msg, fromName, msg.tabId ?? sender?.tab?.id); respond({ ok: true }); return false;
     case "send_failed":    onSendFailure(msg, fromName); respond({ ok: true }); return false;

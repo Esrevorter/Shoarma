@@ -692,6 +692,44 @@ function downloadLastTranscript() {
   });
 }
 
+// ── v0.9.20 AUTO-PROVISION helper (used by case "start" in the router) ─────
+// Open whichever agent tabs are missing, so the user never has to open
+// Qwen/DeepSeek manually before clicking Start swarm. Two kinds of state
+// must be distinguished:
+//   ENGINE.agents  — bridges that have actually REGISTERED this session
+//                    (authoritative; cleared when a tab closes).
+//   chrome.tabs    — tabs that merely EXIST (a stale/unauthenticated or
+//                    since-closed tab still shows up here; content scripts
+//                    only run at document_idle on load, so an existing tab
+//                    does not guarantee a live bridge).
+// Default pass: create a tab only for an agent with NO tab at all. The
+// forced retry pass (force=true, reached only after the first wait window
+// timed out): also reload an existing-but-unregistered tab, in case its
+// bridge died on a login wall or was never injected. Never disturbs a tab
+// whose bridge already registered, and reuses an existing tab rather than
+// stacking duplicates.
+async function ensureAgentTabs(force) {
+  const want = [
+    { name: "qwen",     url: "https://chat.qwen.ai/" },
+    { name: "deepseek", url: "https://chat.deepseek.com/" },
+  ];
+  for (const w of want) {
+    if (ENGINE.agents.has(w.name)) continue;         // bridge is live — leave it alone
+    let tabs = [];
+    try { tabs = await chrome.tabs.query({ url: w.url + "*" }); } catch {}
+    if (!tabs.length) {
+      engLog("INFO", `auto-provision: opening ${w.name} tab`, { url: w.url });
+      try { await chrome.tabs.create({ url: w.url, active: false }); } catch (e) {
+        engLog("ERROR", `auto-provision: could not open ${w.name} tab`, { error: String(e?.message || e) });
+      }
+    } else if (force) {
+      engLog("WARN", `auto-provision: ${w.name} tab exists but never registered — reloading it`,
+             { tabId: tabs[0].id });
+      try { await chrome.tabs.reload(tabs[0].id); } catch {}
+    }
+  }
+}
+
 // ── message router (this is the "WebSocket server", minus the socket) ──────
 // NOTE: the listener must be registered SYNCHRONOUSLY. MV3 decides whether to
 // keep the message channel open for sendResponse based on what the listener
@@ -765,7 +803,35 @@ async function handleEngineMessage(msg, sender, respond) {
     }
     case "start": {
       const cfg = await chrome.storage.sync.get({ turns: 6, timeout: 180 });
-      if (ENGINE.state !== "armed") arm(msg.topic || "", msg.turns || cfg.turns, msg.timeout || cfg.timeout);
+      // v0.9.20 AUTO-PROVISION: "Start swarm" used to hard-fail unless the two
+      // chat tabs were already open AND their bridges had registered — users
+      // had to open Qwen/DeepSeek manually before clicking. Now the engine
+      // opens whatever is missing itself and waits for the registrations.
+      if (ENGINE.agents.size < 2) { await ensureAgentTabs(); }
+      if (ENGINE.state !== "armed") {
+        // Wait for BOTH agents (up to 12 s total). The previous code armed
+        // immediately after the first wait window even when only one agent
+        // had registered — arm() then failed with the generic "need two
+        // registered agents" and the user saw a dead Start button with no
+        // hint that a tab was stuck on a login wall.
+        const t0 = Date.now();
+        while (ENGINE.agents.size < 2 && Date.now() - t0 < 8000) {   // SPA boot + register
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        if (ENGINE.agents.size < 2) {
+          engLog("WARN", `auto-provision: only ${[...ENGINE.agents.keys()].join(",") || "no"} agent(s) registered in 8 s — retrying tab spawn`,
+                 { qwen: !!ENGINE.agents.has("qwen"), deepseek: !!ENGINE.agents.has("deepseek") });
+          await ensureAgentTabs(true);                   // force: second chance for slow logins
+          const t1 = Date.now();
+          while (ENGINE.agents.size < 2 && Date.now() - t1 < 4000) {
+            await new Promise((r) => setTimeout(r, 200));
+          }
+        }
+        if (!arm(msg.topic || "", msg.turns || cfg.turns, msg.timeout || cfg.timeout)) {
+          respond({ ok: false, error: "agents did not register within 12 s — check the opened tabs are logged in" });
+          return false;
+        }
+      }
       startRun(msg); respond({ ok: true }); return false;
   }
     case "stop":           stopRun(); respond({ ok: true }); return false;

@@ -10,54 +10,43 @@
 
 <br/>
 
-**⚡ $0/mo · 🔒 no host permissions · 🖱️ point-and-click control deck · 🛑 one-key HALT**
+**⚡ $0/mo · 🖱️ point-and-click control deck · 🛑 one-key HALT · 🐍 Python now optional**
 
 <br/>
 
-[What it is](#-what-shoarma-is) · [Install in 3 clicks](#-install-the-extension) · [Control deck](#-the-control-deck) · [CI builds](#-ci--packaged-builds) · [End-user guide](#-end-user-overview) · [Troubleshooting](#-troubleshooting)
+[What it is](#-what-shoarma-is) · [Install](#-install-the-extension) · [Control deck](#️-the-control-deck) · [CI builds](#-ci--packaged-builds) · [Troubleshooting](#-troubleshooting) · [Wiki](https://github.com/Esrevorter/Shoarma/wiki)
 
 </div>
 
 ---
 
+## Current release: v0.9.20 — Start swarm provisions its own tabs
 
-## v0.9.18 — The monitor page grew up
+- **▶ Start swarm opens the chat tabs itself.** No more "open Qwen and DeepSeek first".
+  If a bridge hasn't registered, the engine spawns the missing tab in the background;
+  after an 8 s wait it force-reloads any existing-but-silent tab (login wall, dead
+  content script), and only then fails with an actionable error. Verified by
+  `test-v0920-autoprovision.js`.
+- **v0.9.19 log hygiene** — runaway ERROR spam ("Receiving end does not exist" ×370),
+  double-ingested monitor lines and per-turn chatter all eliminated; debug dumps are
+  readable again.
+- **v0.9.18 truthful monitor** — full markdown conversation bubbles (nothing clipped),
+  ▶/■ control in zero-terminal engine mode, honest run statistics from the feed ring.
 
-- **Live conversation, in full.** Every prompt and reply now streams to the
-  monitor as complete markdown bubbles (code blocks, lists, bold) — nothing is
-  truncated to a 200-char preview anymore. Short replies are auto-upgraded to
-  the site's own rendered HTML (sanitized), so Qwen/DeepSeek formatting shows
-  exactly as on the chat page.
-- **Start/Stop from the monitor works** in zero-terminal *engine* mode: ▶ arms
-  and starts the in-browser swarm through the extension itself instead of only
-  talking to the legacy Python orchestrator over WebSocket.
-- **RUN statistics are truthful.** Turns-captured / last-hop / started counters
-  are derived from the engine's authoritative feed ring, not from lagging state
-  broadcasts that never updated mid-run.
-- Self-healing capture (v0.9.17): "I prefer this response"-style UI chrome is
-  filtered out of reply scanning; a broken-record guard caps identical failed
-  submissions so an impass terminates with one honest error instead of a loop.
+## The story so far
 
-## v0.6 — Start when YOU say start
-
-- **No more auto-fire.** Launching `orchestrator.py` only *arms* the swarm: it
-  waits until you press **▶ Start swarm** (popup, HUD pill, or the monitor page).
-- **Your Topic is honored.** The popup's Topic/Turns travel with the ▶ frame, so
-  the question you typed is what the agents receive — not the built-in debate.
-- **Qwen confirm-gate.** After each reply the bridge auto-clicks the site's
-  "prefer this response"-style confirmation when it can find one; if the label
-  changed, the debug dump now lists the actual buttons it saw.
-- **No placeholder spirals.** A failed capture is retried once per hop and never
-  relayed to the other debater as if it were an argument.
-- HUD pills got plain ▶ Start / ■ Stop buttons; the popup shows the swarm phase.
+| Version | What landed |
+|---|---|
+| **v0.9.x** | The swarm became **fully browser-native**: `swarm-engine.js` (MV3 service worker) runs the whole A↔B loop — no Python, no WebSocket needed. Popup gained an *Orchestrator* selector (🌐 In-browser engine / 🖥️ Remote Python). Then: promise-safe chrome.* calls (worker can't die silently), late-reply adoption & ghost-send recovery, Ctrl+Enter submit detection for DeepSeek, monitor NaN-seq fix, log hygiene, auto-provision. |
+| **v0.6–v0.8** | Start when *you* say start (arming, ▶ frames carry Topic/Turns), Qwen confirm-gate, no placeholder spirals; single-flight turn guard + cooldown retries; capture hardening (echo guard, shadow-DOM walk, chrome-word filter); Windows-proof UTF-8 referee. |
+| **v0.4–v0.5** | The live **monitor page** (third tab, real-time transcript, 📋 Copy debug); capture hardening against DOM desyncs. |
+| **v0.3** | Control-deck popup, CI packaging, per-run transcripts. |
 
 ## 🥩 What Shoarma Is
 
-Shoarma is a tiny **Chrome extension + Python referee** that turns two free, authenticated LLM web UIs — currently **Qwen** and **DeepSeek** — into autonomous conversational agents that argue *with each other*, on a loop, while you watch. No API keys, no quota purchases: it drives the chat websites you already log into, reusing your existing session.
+Shoarma is a **Chrome extension** that turns two free, authenticated LLM web UIs — currently **Qwen** and **DeepSeek** — into autonomous conversational agents that argue *with each other*, on a loop, while you watch. No API keys, no quota purchases: it drives the chat websites you already log into, reusing your existing session.
 
-The extension injects prompts into each page's own input box (React-safe), waits for the reply to finish rendering, scrapes it out of the DOM, and hands it to the *other* model through a localhost WebSocket. The Python orchestrator referees: routing messages, alternating turns, enforcing a hard turn cap, and streaming the transcript to disk.
-
-**Since v0.3 you don't need a terminal to run it.** The toolbar popup is a full control deck — set the topic, number of turns, timeout and port there; hit **🚀 Launch swarm**; watch both tabs work. GitHub Actions builds a ready-to-use extension zip on every push.
+The extension injects prompts into each page's own input box (React-safe), waits for the reply to finish rendering, scrapes it out of the DOM, and hands it to the *other* model. **Since v0.9 the referee itself is a service worker inside the extension** (`swarm-engine.js`): tabs talk over `chrome.runtime` messaging — no sockets, no localhost, no terminal. A Python orchestrator (`orchestrator.py`) is still there for people who prefer a separate referee process ("Remote Python" mode).
 
 > **Why "Shoarma"?** Cheap, filling, assembled from whatever meat (models) you have lying around, best consumed while watching something happen live. 🌯
 
@@ -66,9 +55,9 @@ The extension injects prompts into each page's own input box (React-safe), waits
 | Claim | How it's actually true |
 |---|---|
 | **Zero cost** | No APIs, no keys. The extension talks to the *websites*, using the logins you already have. |
-| **Zero host permissions** | `manifest.json` requests no host access, no tabs-read beyond two sites, nothing that shows a scary install warning. |
-| **Zero terminal required** | Popup → 🚀 Launch swarm (via an optional one-line native-host registration). Classic `python orchestrator.py` still works for everyone else. |
-| **Settings in the UI** | Topic, turns, timeout, port, global halt — all live in the popup, persisted with `chrome.storage.sync`, pushed to open tabs instantly. |
+| **No scary install warning** | `manifest.json` asks for `storage`, `tabs`, `downloads`, `scripting` and host access **only** to `chat.qwen.ai` + `chat.deepseek.com`. Nothing else. |
+| **Zero terminal required** | Since v0.9 everything runs in the browser: popup → 🚀 Launch swarm → ▶ Start swarm. Python is optional (remote mode only). |
+| **Settings in the UI** | Topic, turns, timeout, port, orchestrator mode, global halt — all live in the popup, persisted with `chrome.storage.sync`, pushed to open tabs instantly. |
 | **CI-packaged** | Every push runs validation + packaging; tagged releases carry a zip you unzip and load. No repo cloning needed. |
 
 ---
@@ -81,19 +70,24 @@ The extension injects prompts into each page's own input box (React-safe), waits
 │  bridge.js (agent node) │   │  bridge.js (agent node)  │
 │  glass HUD · Esc=HALT   │   │  glass HUD · Esc=HALT    │
 └────────────┬────────────┘   └────────────┬─────────────┘
-             │      ws://127.0.0.1:<port>  │
+             │  chrome.runtime messages    │
              └──────────────┬──────────────┘
                             ▼
-        ┌───────────────────────────────┐   launched by either:
-        │  orchestrator.py (referee)    │◄── 🚀 popup → launcher.py (native host)
-        │  routes A→B→A · turn caps     │   or  $ python orchestrator.py
-        │  per-run transcripts + logs   │
-        └───────────────────────────────┘
-             ▲ settings flow both ways:
-        ┌────┴──────────┐   popup saves to chrome.storage.sync;
-        │  popup UI     │   bridge reacts live; scripts/sync-settings.py
-        │  control deck │   can export them for a manual CLI run
-        └───────────────┘
+        ┌───────────────────────────────────────┐
+        │ swarm-engine.js  (MV3 service worker) │  DEFAULT MODE
+        │ strict A↔B alternation · turn cap     │  no Python, no sockets
+        │ arm/start/stop · transcripts          │
+        │ auto-provision of missing tabs        │
+        │ mirrors state/feed → chrome.storage   │
+        └───────────────┬───────────────────────┘
+                        ▼
+        ┌───────────────────────────────────────┐   monitor.html — third tab,
+        │  monitor page (live transcript view)  │   reads the storage mirrors
+        └───────────────────────────────────────┘
+
+  ALTERNATIVE ("Remote Python") MODE:
+        bridge.js ──ws://127.0.0.1:<port>──► orchestrator.py
+        (same protocol; adds HTTP GET /state side-feed for the monitor)
 ```
 
 ### 📁 Repository map
@@ -101,27 +95,32 @@ The extension injects prompts into each page's own input box (React-safe), waits
 | File | Role |
 |---|---|
 | `manifest.json` | Extension declaration (MV3). Content scripts on the two chat sites only. |
-| `bridge.js` | The agent node. Injects prompts, detects generation start/end, scrapes replies, HUD, Esc-HALT, reads popup settings live, answers status pings. |
-| `popup.html/css/js` | **The control deck** — topic/turns/timeout/port/halt, 🚀 one-click launch, live tab roster, download link for the referee. |
-| `background.js` | Service worker: spawns the orchestrator via the native launcher, badge = live agent count. |
-| `launcher.py` + `launcher/` | Native messaging host: lets the popup start `orchestrator.py` with your UI settings, logging to `Downloads/shoarma/`. |
-| `hud.css` | Glassmorphic HUD styling, injected as a content-script stylesheet (plus inline fallback). |
-| `monitor.html/css/js` | **The live monitor** (v0.4) — a third tab with the full conversation streaming in real time: speaker-colored turns, agent roster, debug-stream toggle, one-click 📋 copy-debug dump. No terminal watching required. |
-| `orchestrator.py` | The referee. asyncio + websockets router, turn governor, `settings.json` support, per-run timestamped transcripts & logs, CLI flags, and an HTTP side-feed (`GET /state`) powering the monitor page. |
-| `scripts/install-launcher.py` | One-time native-host registration (macOS/Linux/Windows). |
-| `scripts/sync-settings.py` | Exports your popup settings from Chrome storage → `settings.json` for CLI runs. |
-| `.github/workflows/build-extension.yml` | CI: validates, packages the extension zip, publishes Releases on `v*` tags. |
+| `swarm-engine.js` | **The in-browser referee** (service worker, since v0.9). Port of the orchestrator protocol over `chrome.runtime` messaging: register → arm → start → say/reply alternation → transcript; v0.9.8 promise-safe guards; v0.9.20 auto-provision of agent tabs. |
+| `bridge.js` | The agent node. Injects prompts, detects generation start/end, scrapes replies (shadow-DOM walk, echo guard, chrome filter), HUD pill, Esc-HALT, ▶/■ buttons, dual transport (engine / WebSocket). |
+| `popup.html/css/js` | **The control deck** — topic/turns/timeout/port, Orchestrator-mode selector, 🚀 launch/arm, ▶ Start / ■ Stop, live tab roster, activity log + copy. |
+| `monitor.html/css/js` | **The live monitor** — third tab streaming the full conversation as markdown bubbles, agent roster, debug toggle, 📋 Copy debug, ▶/■ controls. Works in both modes. |
+| `orchestrator.py` | Optional Python referee for remote mode: asyncio + websockets router, turn governor, `settings.json`, per-run transcripts/logs, HTTP `/state` side-feed. |
+| `launcher.py` + `launcher/` + `scripts/install-launcher.py` | Legacy native-messaging host (retired in v0.9; kept for the old remote workflow). |
+| `scripts/sync-settings.py` | Exports popup settings from Chrome storage → `settings.json` for CLI runs. |
+| `hud.css` / `monitor.css` / `popup.css` | Glassmorphic styling for pill / monitor / popup. |
+| `tools/build_release.py` | Canonical validator + zip builder (used by CI since v0.9.5; refuses to ship manifest-inconsistent bundles). |
+| `tools/shoarma-probe*.js` + `tools/PROBE.md` | DOM probes that dump the real page markup when selectors break. |
+| `tools/generate-docs-data.py` | Extracts doc ground-truth (version, SITES map, engine message cases, live releases) so README/Wiki can be checked against code. |
+| `.github/workflows/build-extension.yml` | CI: validates, packages via `tools/build_release.py`, publishes Releases on `v*` tags. |
+| `test-*.js`, `tests/` | Node regression suites (recovery, desync, monitor, autoprovision…) + compliance tests. Run them directly: `node test-v0920-autoprovision.js`. |
 | `SPEC.md` | Original architecture spec — including the hard-won gotchas table. |
+| `Qwen.md` | Session log: publishing workflow, root causes, verified release history. |
+| `RULES.md` | Working agreement for agents on this repo (verify-first, honest docs). |
 
 ---
 
 ## 📦 Install the extension
 
-**Prerequisites:** Google Chrome (or any Chromium browser), Python ≥ 3.10, and free logged-in accounts at [chat.qwen.ai](https://chat.qwen.ai) and [chat.deepseek.com](https://chat.deepseek.com).
+**Prerequisites:** Google Chrome (or any Chromium browser). That's it — Python ≥ 3.10 is only needed if you want the optional remote-Python mode. Free logged-in accounts at [chat.qwen.ai](https://chat.qwen.ai) and [chat.deepseek.com](https://chat.deepseek.com).
 
 ### Option A — the CI package (no git!) 😎
 
-1. Go to **Releases** → download `shoarma-extension-vX.Y.Z.zip` (built automatically by GitHub Actions).
+1. Go to **Releases** → download `shoarma-vX.Y.Z-chrome.zip` from the latest tag (currently **v0.9.20**).
 2. Unzip it anywhere.
 3. Open `chrome://extensions` → toggle **Developer mode** (top right) → **Load unpacked** → pick the unzipped folder.
 4. Pin the 🌯 icon to your toolbar. Done.
@@ -132,18 +131,9 @@ The extension injects prompts into each page's own input box (React-safe), waits
 
 Clone/download this repo and **Load unpacked** pointing at the repo root. Same result.
 
-### Optional — one-click launch (skip the terminal forever)
+### Optional — remote-Python mode (legacy)
 
-The popup's 🚀 button talks to a small native helper. Register it once:
-
-```bash
-pip install websockets                       # the referee's only dependency
-python scripts/install-launcher.py <EXTENSION_ID>
-```
-
-`<EXTENSION_ID>` is the 32-letter id shown under the extension on `chrome://extensions`. After that, 🚀 Launch swarm starts the orchestrator silently in the background; its output lands in `Downloads/shoarma/launcher.log`.
-
-> Without this step everything still works — the popup tells you exactly what to do, or run `python orchestrator.py` yourself.
+Prefer a separate referee process? `pip install websockets`, run `python orchestrator.py`, and set the popup's **Orchestrator** selector to **🖥️ Remote Python**. The native launcher (`scripts/install-launcher.py`) that used to spawn it from the 🚀 button was retired in v0.9 — start the process yourself in a terminal.
 
 ---
 
@@ -153,11 +143,17 @@ Click the 🌯 toolbar icon:
 
 | Control | What it does |
 |---|---|
+| **Coach strip** | Step 1→2→3 guidance with a progress bar; tells you when both agents are wired. |
 | **Topic** | The opening prompt for the debate. Leave empty for the built-in starter. |
-| **Turns / Timeout / Port** | Debate length, per-reply deadline, WebSocket port. Saved automatically. |
-| **🚀 Launch swarm** | Starts the referee with these exact settings (needs the optional launcher). |
-| **Halt all agents** | Global kill switch — freezes every tab instantly. Mirrors the HUD's HALT and the Esc key. |
+| **Turns / Timeout / Port** | Debate length (1–50), per-reply deadline (30–600 s), WebSocket port (remote mode only — dimmed in engine mode). Saved automatically. |
+| **Orchestrator** | 🌐 **In-browser engine** (default, no Python) or 🖥️ **Remote Python** orchestrator. |
+| **🚀 Launch swarm** | Engine mode: arms the in-browser swarm. Remote mode: legacy launcher path (tells you to run `orchestrator.py` manually). |
+| **▶ Start swarm / ■ Stop** | Starts/stops the run with the popup's Topic/Turns. Since v0.9.20 Start opens any missing chat tabs itself. |
+| **📟 Open live monitor** | Opens the monitor tab. |
+| **⬇ Export transcript** | Downloads the last run's transcript JSON. |
+| **Halt all agents** | Global kill switch — freezes every tab instantly. Mirrors the HUD's ⏸ and the Esc key. |
 | **Live roster** | Each open chat tab with its state (`ready`, `writing…`, `idle`, `halted`) and turn count. |
+| **Activity log** | Centralized popup event log, 📋 Copy all / Clear — bug-report material. |
 
 Settings are **live**: change the port or flip Halt and open tabs react without reloading. They persist across restarts via your Chrome profile.
 
@@ -165,21 +161,20 @@ Settings are **live**: change the port or flip Halt and open tabs react without 
 
 ## ▶️ Running your first swarm
 
-1. Log into **chat.qwen.ai** and **chat.deepseek.com** in two side-by-side tabs.
-2. Each tab shows a glass pill bottom-right: `connecting…` → `ready` once the referee exists.
-3. Start the referee — **either**: click 🚀 in the popup, **or** run `python orchestrator.py` in a terminal.
-4. Watch: Qwen argues, DeepSeek rebuts, back and forth, `turn N done in X.Xs`.
-5. When it finishes, grab `transcript-<timestamp>.json` (+ a readable `.log`) from `Downloads/shoarma/` (or the repo dir for CLI runs).
+1. Click 🌯 → **🚀 Launch swarm** (arms the engine), then **▶ Start swarm**.
+   That's genuinely all — since v0.9.20 the engine opens the Qwen/DeepSeek tabs itself if they aren't registered yet. (You do need to be logged into both at least once; if provisioning stalls you'll get an explicit "check the opened tabs are logged in" hint.)
+2. Watch: Qwen argues, DeepSeek rebuts, back and forth. Open **📟 Open live monitor** to follow the full conversation with timings.
+3. When it finishes: **⬇ Export transcript** downloads the JSON; the monitor keeps the feed readable after the run.
 
-**Emergency brake:** press **Esc** in any tab, click **HALT**, or flip **Halt all agents** in the popup. Nothing is irreversible.
+**Emergency brake:** press **Esc** in any tab, click **⏸** on the HUD pill, or flip **Halt all agents** in the popup. Nothing is irreversible.
 
 ---
 
 ## 🧑‍💻 End-user overview (for the non-tech friend)
 
-You installed the zip and registered the launcher. From here on it's three moves:
+From here on it's three moves:
 
-> **Open two chats → click 🌯 → type a topic → 🚀.**
+> **Click 🌯 → type a topic → 🚀 → ▶.**
 
 Then watch two AIs argue like it's a sport. The HUD dot tells you who's doing what:
 
@@ -188,17 +183,11 @@ Then watch two AIs argue like it's a sport. The HUD dot tells you who's doing wh
 | 🟦 pulsing cyan | injecting a prompt / waiting for the model to answer |
 | 🟢 green | idle — reply captured, waiting for the next message |
 | 🟡 amber | ready — connected to the referee, awaiting orders |
-| 🔴 red | halted or error — press Esc / HALT to stop, reload tab to reset |
+| 🔴 red | halted or error — press Esc / ⏸ to stop, reload tab to reset |
 
-The popup badge number = how many agent tabs are alive. If it says `0/2 agent(s) wired`, reload the chat tabs.
+The popup badge number = how many agent tabs are alive. If the roster says `0/2 agent(s) wired`, reload the chat tabs (or just press ▶ Start swarm — it will try to fix things itself).
 
-**v0.4 — you don't even have to watch the tabs.** Hit **📟 Open live monitor** in the popup: a third tab streams the entire conversation as it happens (speaker-colored turns, per-agent state, timings), with a debug toggle and a one-click **📋 Copy debug** dump for bug reports. The orchestrator runs quietly in the background; its feed stays readable for 60s after the last turn.
-
-**v0.5 — capture hardening (the "no response captured" + echo release).** Real-world runs exposed three failure modes, all fixed:
-- **Echo guard** — the bridge could read its *own prompt* back out of the user bubble (generic `[class*="markdown"]` selectors match both sides), desyncing the whole debate into an echo loop. Bubbles inside `data-turn-role="user"` subtrees are now rejected outright, and any capture identical to the text we just sent is skipped.
-- **Shadow-DOM walk** — Qwen renders replies inside shadow roots that a flat `querySelectorAll` never sees (`totalMatches: 0`). Candidate scanning now recurses through open shadow roots, and nested double-matches are deduped so text isn't read twice.
-- **Chrome filter + liveness re-check** — UI strings like *"I prefer this response"* are no longer mistaken for replies, and truncated captures (a sentence cut mid-stream) get one extra settle-window pass before being accepted. Generation-start detection also triggers on *new assistant bubble appeared*, not just the Stop button (Qwen has none) — removing a guaranteed 6 s stall per hop.
-- **Windows-proof referee** — transcripts/logs are written UTF-8 explicitly (the old cp1252 crash killed the process *after* a successful run), console output strips emoji safely, and closing tabs at run end no longer dumps a traceback.
+**The monitor page (v0.4, overhauled v0.9.18)** is the comfy seat: a third tab streaming the entire conversation as complete markdown bubbles (speaker-colored, nothing truncated), per-agent state, timings, a debug-stream toggle, and a one-click **📋 Copy debug** dump for bug reports. It works with zero terminals — it reads the engine's mirrors straight out of `chrome.storage`.
 
 ---
 
@@ -206,14 +195,14 @@ The popup badge number = how many agent tabs are alive. If it says `0/2 agent(s)
 
 `.github/workflows/build-extension.yml` runs on every push/PR:
 
-1. **Validate** — manifest JSON check + syntax-check every JS/Python source.
-2. **Package** — flat `shoarma-extension-vX.Y.Z.zip` (version read from `manifest.json`).
+1. **Validate** — manifest JSON check + `node --check` (bridge/swarm-engine/popup/monitor) + `py_compile` on all Python.
+2. **Package** — `tools/build_release.py` (canonical builder since v0.9.5) zips exactly the runtime files and refuses to ship if any manifest-referenced path is missing or a retired file sneaks in.
 3. **Publish** — artifact on every branch; on a `v*` tag, the zip attaches to a GitHub Release automatically.
 
 Cutting a release is literally:
 
 ```bash
-git tag v0.3.0 && git push origin v0.3.0    # → Release with downloadable zip appears
+git tag v0.9.21 && git push origin v0.9.21    # → Release with downloadable zip appears
 ```
 
 ---
@@ -225,27 +214,31 @@ Shoarma assumes the worst of hostile web UIs and degrades gracefully:
 | Symptom | What the code does |
 |---|---|
 | React composer ignores injected text | fiber probe (`reactHoldsText`) detects DOM/model desync → one bounded caret retype through the site's own input pipeline, then direct handler invocation |
+| Enter inserts a newline instead of sending | declared `sendKey` per site (DeepSeek: Ctrl+Enter) + handler-signature sniffing (`detectEnterCombo`) before guessing |
 | Site shows a feedback gate ("Good Response", "I prefer this response") | confirm-gate auto-click; the same strings are blacklisted from reply capture so UI chrome can never poison the thread |
 | Nothing capturable after a send | one bounded capture retry per hop, then an honest `NO RESPONSE CAPTURED` diagnostic (bubble classes included) — never a placeholder relayed as an argument |
+| Message accepted but composer emptied late ("ghost send") | final settle check treats it as submitted; a reply captured after a throw is *adopted*, not re-sent (v0.9.4) |
 | Same message fails repeatedly | broken-record guard: max 2 attempts per identical prompt, then the run terminates cleanly instead of looping forever |
-| Monitor shows no data | engine mirrors its log ring + full-text feed into `chrome.storage.local`; the monitor drains both every 800 ms and dedupes by sequence |
+| Chat tabs not open when you press Start | v0.9.20 auto-provision: spawn missing tabs, then force-reload silent existing ones, then fail with an actionable hint |
+| Monitor shows no data | engine mirrors its debug ring + full-text feed into `chrome.storage.local`; the monitor drains both every 800 ms and dedupes by sequence |
+| MV3 worker dies mid-run | promise-safe `asPromise()/safeCatch()` wrappers + unhandled-rejection shield (v0.9.8) keep it alive; repeats coalesce into one counted line (v0.9.19) |
 
-Every failure path emits structured debug lines; **📋 Copy debug** on the
-monitor gathers the whole story for a bug report.
+Every failure path emits structured debug lines; **📋 Copy debug** on the monitor gathers the whole story for a bug report.
 
 ## 🔧 Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| HUD stuck on `connecting…` | Referee not running — 🚀 in the popup or `python orchestrator.py`. Check the popup **Port** matches. |
-| 🚀 says "One-time setup needed" | Run `python scripts/install-launcher.py <id>` once (see above). Or just use the terminal. |
-| Reply never arrives / `(no response captured)` | Site DOM changed — update selectors in `bridge.js` `SITES` (DevTools is your friend; see SPEC.md gotchas). |
-| Both tabs say `ready` but nothing happens | Someone pressed Esc/HALT — check the popup roster, flip Halt off. |
-| Port already in use | The referee refuses to double-bind; 🚀 detects this and tells you. Change **Port** in the popup. |
+| HUD stuck on `connecting…` | Engine mode: the service worker may have gone dormant — click the 🌯 popup once to wake it, then reload the tab. Remote mode: referee not running — `python orchestrator.py`; check the popup **Port** matches. |
+| 🚀 in remote mode says launcher retired | Expected since v0.9 — run `python orchestrator.py` in a terminal, or switch the Orchestrator selector back to 🌐 In-browser engine. |
+| Reply never arrives / `(no response captured)` | Site DOM changed — run the probe in `tools/PROBE.md`, then update selectors in `bridge.js` `SITES` (DevTools is your friend; see SPEC.md gotchas). |
+| Both tabs say `ready` but nothing happens | Someone pressed Esc/⏸ — check the popup roster, flip Halt off. |
+| Start swarm times out ("agents did not register within 12 s") | One of the auto-opened tabs is stuck on a login wall — log in there once, press ▶ again. |
+| Port already in use (remote mode) | The referee refuses to double-bind; change **Port** in the popup and relaunch. |
 | Want CLI runs to use my popup settings | `python scripts/sync-settings.py <id>` writes `settings.json`; the orchestrator picks it up automatically. |
 
 ---
 
 ## 📜 License & lineage
 
-MIT — see `LICENSE`. Built from [`SPEC.md`](SPEC.md); [`Qwen.md`](Qwen.md) documents the publishing workflow. **v0.3** added the control-deck popup, one-click launch, CI packaging and per-run transcripts. Use responsibly: you're automating *your own* logged-in sessions; keep turn counts sane and be nice to the services hosting you. 🌯
+MIT — see `LICENSE`. Built from [`SPEC.md`](SPEC.md); [`Qwen.md`](Qwen.md) documents the publishing workflow and per-version root-cause history; [`RULES.md`](RULES.md) is the working agreement that keeps docs and claims honest. **v0.3** added the control-deck popup and CI packaging; **v0.9** moved the whole swarm into the browser; **v0.9.20** is current. Use responsibly: you're automating *your own* logged-in sessions; keep turn counts sane and be nice to the services hosting you. 🌯
